@@ -55,7 +55,8 @@ def fold_batch_norm(conv_layer, bn_layer):
     new_bias = beta - mean * gamma / np.sqrt(variance + epsilon)
     return new_weights, new_bias
 
-model_path = "model_data/tiny-yolo-voc.h5"
+#model_path = "model_data/tiny-yolo-voc.h5"
+model_path = "model_data/yolo.h5"
 
 # Load the model that was exported by YAD2K.
 model = load_model(model_path)
@@ -68,82 +69,168 @@ new_weights = []
 
 print("Creating optimized model\n")
 
-for index, layer in enumerate(model.layers):
-  print(str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
-  #print(str(index)+" weights:"+str(layer.get_weights())+"\n")
-  new_layer = layers.deserialize({'class_name': layer.__class__.__name__,
-                                  'config': layer.get_config()})
-  if prev_layer is not None:
-    print(str(index)+"prev_layer:"+prev_layer.__class__.__name__)
-    if not layer.get_weights():
-      print("Layer '"+layer.__class__.__name__+" has no weights")
-      all_layers.append(new_layer(prev_layer))
-      prev_layer = all_layers[-1]
-      print(str(index)+"prev_layer(1) set to :"+prev_layer.__class__.__name__)
-    else:
-      weight_shape = np.shape(layer.get_weights())
-      print("Layer '"+layer.__class__.__name__+" weight shape:"+str(weight_shape))
-      layer_done = False
-      if layer.__class__.__name__ == "BatchNormalization" and prev_orig_layer.__class__.__name__ == "Conv2D":
-        # batchnorm following a conv2D layer, set folded weights for previous conv layer
-        print("Folding batch norm layer")
-        new_config = prev_orig_layer.get_config()
-        new_config['use_bias'] = True
-        new_layer = layers.deserialize({'class_name': prev_orig_layer.__class__.__name__,
-                                  'config': new_config})
-        all_layers.append((new_layer)(prev_layer))
-        prev_layer = all_layers[-1]
-        print("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
-        new_weights.append(fold_batch_norm(prev_orig_layer, layer))
-        #new_weights.append(prev_orig_layer.get_weights())
-        layer_done = True
-      else:
-        if prev_orig_layer.__class__.__name__ == "Conv2D":
-          # conv without following batchnorm, set normal weights for previous conv layer
-          print("Conv2d layer without following batchnorm")
-          print("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
-          new_layer = layers.deserialize({'class_name': prev_orig_layer.__class__.__name__,
-                                  'config': prev_orig_layer.get_config()})
-          all_layers.append((new_layer)(prev_layer))
-          new_weights.append(prev_orig_layer.get_weights())
-      if not layer_done:
-        # process all layer types except
-        if layer.__class__.__name__ != "Conv2D" or index + 1 == len(model.layers):
-          all_layers.append((new_layer)(prev_layer))
-          print("appending new layer:"+new_layer.__class__.__name__)
-          print("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
-          new_weights.append(layer.get_weights())
-          #print("adding weights for new layer type " + all_layers[-1].__class__.__name__)
-      prev_layer = all_layers[-1]
-      print(str(index)+"prev_layer(2) set to :"+prev_layer.__class__.__name__)
+
+model_config = model.get_config()
+layers_config = model_config['layers']
+
+inbound_by_name = {}
+
+for layer_dict in layers_config:
+  layer_name = layer_dict['name']
+  inbound_names = []
+  inbound_nodes = layer_dict['inbound_nodes']
+  if len(inbound_nodes) > 0:
+    #print(str(inbound_nodes))
+    inbound_node_list = inbound_nodes[0]
+    for node in inbound_node_list:
+      inbound_names.append(node[0])
+    print("Layer name:"+layer_name+": Inbound:"+str(inbound_names))
   else:
+    print("Layer name:"+layer_name+": No inbound layers")
+  inbound_by_name[layer_name] = inbound_names
+
+
+#import json
+#print(json.dumps(model.get_config(),sort_keys=True, indent=4))
+
+
+def layer_name(layer):
+  return layer.get_config()['name']
+
+def layer_clone(layer):
+  return layers.deserialize({'class_name': layer.__class__.__name__,
+                                    'config': layer.get_config()})
+
+def replaced_name(the_name, replacements):
+  if the_name in replacements:
+    return replacements[the_name]
+  else:
+    return the_name
+
+def replaced_name_list(the_names, replacements):
+  result = []
+  for name in the_names:
+    result.append(replaced_name(name, replacements))
+  return result
+
+
+def input_layers_outputs(inbound_names, layer_by_name):
+  #print("input_layers_outputs: inbound_names: "+str(inbound_names)+", all="+str(layer_by_name))
+  print("input_layers_outputs: inbound_names: "+str(inbound_names))
+  if len(inbound_names) == 1:
+    result = layer_by_name[inbound_names[0]]
+    print("input_layers_outputs: returning single result: "+str(result))
+    return result;
+  else:
+    result = []
+    for name in inbound_names:
+      result.append(layer_by_name[name])
+    print("input_layers: returning list result: "+str(result))
+    return result
+
+
+def orig_input_layers(inbound_names, model):
+  if len(inbound_names) == 1:
+    result = model.get_layer(name=inbound_names[0])
+    print("orig_input_layers: returning single result: "+str(result))
+    return result 
+  else:
+    result = []
+    for iname in inbound_names:
+      result.append(model.get_layer(name=iname))
+    print("orig_input_layers: returning single result: "+str(result))
+    return result
+
+
+layer_by_name = {}
+weights_by_name = {}
+output_by_name = {}
+replaced_layer = {}
+
+def register_new_layer(the_name, the_layer, the_output):
+  all_layers.append(the_output)
+  layer_by_name[the_name] = the_layer
+  output_by_name[the_name] = the_output
+
+for index, layer in enumerate(model.layers):
+  print("\n"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
+  print("Layer name:"+layer_name(layer))
+
+  inbounds = replaced_name_list(inbound_by_name[layer_name(layer)], replaced_layer)
+  print("Inbounds:"+str(inbounds)+", len "+str(len(inbounds)))
+
+  if len(inbounds) == 0:
+    # create an input layer
     batch_input_shape = layer.get_config()['batch_input_shape']
     input_shape = batch_input_shape[1:]
     print(str(input_shape), str(batch_input_shape))
     new_layer = Input(shape=input_shape)
-    all_layers.append(new_layer)
-    #all_layers.append(Input(shape=(image_height, image_width, 3)))
-    #all_layers.append(new_layer)
-    prev_layer = all_layers[-1]
-    print(str(index)+"prev_layer(3) set to :"+prev_layer.__class__.__name__)
-
-  prev_new_layer = new_layer
-  #print("clone:"+str(index)+":"+new_layer.__class__.__name__+":"+str(new_layer.get_config())+"\n")
-  #print("clone:"+str(index)+":"+new_layer.__class__.__name__+"\n")
-  prev_orig_layer = layer
-  #print("new_weights shape:"+str(np.shape(new_weights))+"\n")
-
-#print(str(new_weights))
+    register_new_layer(layer_name(layer), new_layer, new_layer)
+  else:
+    orig_inputs = orig_input_layers(inbounds, model)
+    print("orig_inputs:"+str(orig_inputs))
+    if not layer.get_weights():
+      print("Layer '"+layer.__class__.__name__+" has no weights")
+      new_layer = layer_clone(layer)
+      inputs = input_layers_outputs(inbounds, output_by_name)
+      register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
+    else:
+      weight_shape = np.shape(layer.get_weights())
+      print("Layer '"+layer.__class__.__name__+" weight shape:"+str(weight_shape))
+      layer_done = False
+      print("orig_inputs:"+str(orig_inputs)+", class "+str(orig_inputs.__class__))
+      print("BNTEST:"+layer.__class__.__name__ +" "+ orig_inputs.__class__.__name__)
+      
+      if layer.__class__.__name__ == "BatchNormalization" and orig_inputs.__class__.__name__ == "Conv2D":
+        # batchnorm following a conv2D layer, set folded weights for previous conv layer
+        print("Folding batch norm layer")
+        prev_orig_layer = orig_input_layers(inbounds, model)
+        new_config = prev_orig_layer.get_config()
+        new_config['use_bias'] = True
+        new_layer = layers.deserialize({'class_name': prev_orig_layer.__class__.__name__,
+                                  'config': new_config})
+        prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
+        inputs = input_layers_outputs(prev_inbounds, output_by_name)
+        register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
+        print("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
+        weights_by_name[layer_name(new_layer)] = fold_batch_norm(prev_orig_layer, layer)
+        replaced_layer[layer_name(layer)] = layer_name(prev_orig_layer)
+        #new_weights.append(fold_batch_norm(prev_orig_layer, layer))
+        #new_weights.append(prev_orig_layer.get_weights())
+        layer_done = True
+      else:
+        if orig_inputs.__class__.__name__ == "Conv2D":
+          # conv without following batchnorm, set normal weights for previous conv layer
+          print("Conv2d layer without following batchnorm")
+          prev_orig_layer = model.get_layer(name=orig_inputs)
+          new_layer = layer_clone(prev_orig_layer)
+          prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
+          inputs = input_layers_outputs(prev_inbounds, output_by_name)
+          register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
+          weights_by_name[layer_name(new_layer)]=prev_orig_layer.get_weights()
+      
+      if not layer_done:
+        # process all layer types except conv2d if not the last layer
+        # if layer.__class__.__name__ != "Conv2D" or index + 1 == len(model.layers):
+        if True:
+          new_layer = layer_clone(layer)
+          inputs = input_layers_outputs(inbounds, output_by_name)
+          register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
+          print("appending new layer:"+new_layer.__class__.__name__)
+          print("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
+          weights_by_name[layer_name(layer)] = layer.get_weights()
+          #print("adding weights for new layer type " + all_layers[-1].__class__.__name__)
 
 new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
 new_model.summary()
 
-weight_index = 0
-for index, layer in enumerate(new_model.layers):
-  if layer.get_weights():
-    print("Setting weights for layer index "+str(index)+", weight_index "+str(weight_index)+" type " + layer.__class__.__name__)
-    layer.set_weights(new_weights[weight_index])
-    weight_index += 1
+print(str(replaced_layer))
+
+for layer_name, weights in weights_by_name.items():
+  print("Setting weights for layer "+layer_name+" type " + layer_by_name[layer_name].__class__.__name__)
+  print("weights     :"+str(np.shape(weights)))
+  print("orig_weights:"+str(np.shape(layer_by_name[layer_name].get_weights())))
+  layer_by_name[layer_name].set_weights(weights)
 
 
 # The original model has batch normalization layers. We will now create
@@ -162,56 +249,60 @@ for index, layer in enumerate(new_model.layers):
 #
 # We still need to add the LeakyReLU activation as a separate layer, but 
 # in Metal we can combine the LeakyReLU with the conv layer.
-model_nobn = Sequential()
-model_nobn.add(Conv2D(16, (3, 3), padding="same", input_shape=(416, 416, 3)))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(MaxPooling2D())
-model_nobn.add(Conv2D(32, (3, 3), padding="same"))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(MaxPooling2D())
-model_nobn.add(Conv2D(64, (3, 3), padding="same"))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(MaxPooling2D())
-model_nobn.add(Conv2D(128, (3, 3), padding="same"))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(MaxPooling2D())
-model_nobn.add(Conv2D(256, (3, 3), padding="same"))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(MaxPooling2D())
-model_nobn.add(Conv2D(512, (3, 3), padding="same"))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(MaxPooling2D(strides=(1, 1), padding="same"))
-model_nobn.add(Conv2D(1024, (3, 3), padding="same"))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(Conv2D(1024, (3, 3), padding="same"))
-model_nobn.add(LeakyReLU(alpha=0.1))
-model_nobn.add(Conv2D(125, (1, 1), padding="same", activation='linear'))
 
-W_nobn = []
-print("W_nobn shape:"+str(np.shape(W_nobn)))
-W_nobn.extend(fold_batch_norm(model.layers[1], model.layers[2]))
-print("W_nobn shape:"+str(np.shape(W_nobn)))
-W_nobn.extend(fold_batch_norm(model.layers[5], model.layers[6]))
-print("W_nobn shape:"+str(np.shape(W_nobn)))
-W_nobn.extend(fold_batch_norm(model.layers[9], model.layers[10]))
-W_nobn.extend(fold_batch_norm(model.layers[13], model.layers[14]))
-W_nobn.extend(fold_batch_norm(model.layers[17], model.layers[18]))
-W_nobn.extend(fold_batch_norm(model.layers[21], model.layers[22]))
-W_nobn.extend(fold_batch_norm(model.layers[25], model.layers[26]))
-W_nobn.extend(fold_batch_norm(model.layers[28], model.layers[29]))
-W_nobn.extend(model.layers[31].get_weights())
-print("W_nobn shape:"+str(np.shape(W_nobn)))
-#print(str(W_nobn))
-model_nobn.set_weights(W_nobn)
+DO_STATIC_CONVERSION=False
 
-print("model_nobn")
-model_nobn.summary()
+if DO_STATIC_CONVERSION:
+  model_nobn = Sequential()
+  model_nobn.add(Conv2D(16, (3, 3), padding="same", input_shape=(416, 416, 3)))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(MaxPooling2D())
+  model_nobn.add(Conv2D(32, (3, 3), padding="same"))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(MaxPooling2D())
+  model_nobn.add(Conv2D(64, (3, 3), padding="same"))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(MaxPooling2D())
+  model_nobn.add(Conv2D(128, (3, 3), padding="same"))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(MaxPooling2D())
+  model_nobn.add(Conv2D(256, (3, 3), padding="same"))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(MaxPooling2D())
+  model_nobn.add(Conv2D(512, (3, 3), padding="same"))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(MaxPooling2D(strides=(1, 1), padding="same"))
+  model_nobn.add(Conv2D(1024, (3, 3), padding="same"))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(Conv2D(1024, (3, 3), padding="same"))
+  model_nobn.add(LeakyReLU(alpha=0.1))
+  model_nobn.add(Conv2D(125, (1, 1), padding="same", activation='linear'))
 
-for index, layer in enumerate(model_nobn.layers):
-  print("no_bn:"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
-  print("newnb:"+str(index)+":"+new_model.layers[index+1].__class__.__name__+":"+str(new_model.layers[index+1].get_config())+"\n")
-  print(str(np.shape(layer.get_weights())))
-  print(str(np.shape(new_model.layers[index+1].get_weights())))
+  W_nobn = []
+  print("W_nobn shape:"+str(np.shape(W_nobn)))
+  W_nobn.extend(fold_batch_norm(model.layers[1], model.layers[2]))
+  print("W_nobn shape:"+str(np.shape(W_nobn)))
+  W_nobn.extend(fold_batch_norm(model.layers[5], model.layers[6]))
+  print("W_nobn shape:"+str(np.shape(W_nobn)))
+  W_nobn.extend(fold_batch_norm(model.layers[9], model.layers[10]))
+  W_nobn.extend(fold_batch_norm(model.layers[13], model.layers[14]))
+  W_nobn.extend(fold_batch_norm(model.layers[17], model.layers[18]))
+  W_nobn.extend(fold_batch_norm(model.layers[21], model.layers[22]))
+  W_nobn.extend(fold_batch_norm(model.layers[25], model.layers[26]))
+  W_nobn.extend(fold_batch_norm(model.layers[28], model.layers[29]))
+  W_nobn.extend(model.layers[31].get_weights())
+  print("W_nobn shape:"+str(np.shape(W_nobn)))
+  #print(str(W_nobn))
+  model_nobn.set_weights(W_nobn)
+
+  print("model_nobn")
+  model_nobn.summary()
+
+  for index, layer in enumerate(model_nobn.layers):
+    print("no_bn:"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
+    print("newnb:"+str(index)+":"+new_model.layers[index+1].__class__.__name__+":"+str(new_model.layers[index+1].get_config())+"\n")
+    print(str(np.shape(layer.get_weights())))
+    print(str(np.shape(new_model.layers[index+1].get_weights())))
 
 # Make a prediction using the original model and also using the model that
 # has batch normalization removed, and check that the differences between
@@ -220,9 +311,11 @@ for index, layer in enumerate(model_nobn.layers):
 
 print("Comparing models...")
 
-image_data = np.random.random((1, 416, 416, 3)).astype('float32')
+#image_data = np.random.random((1, 416, 416, 3)).astype('float32')
+image_data = np.random.random((1, 608, 608, 3)).astype('float32')
 features = model.predict(image_data)
-features_nobn = model_nobn.predict(image_data)
+if DO_STATIC_CONVERSION:
+  features_nobn = model_nobn.predict(image_data)
 features_auto = new_model.predict(image_data)
 
 def compare_features(features1, features2):
@@ -236,22 +329,25 @@ def compare_features(features1, features2):
           print(i, j, k, ":", features1[0, i, j, k], features2[0, i, j, k], diff)
   print("Largest error:", max_error)
 
-compare_features(features, features_nobn)
+if DO_STATIC_CONVERSION:
+  compare_features(features, features_nobn)
 compare_features(features, features_auto)
 
 # Convert the weights and biases to Metal format.
 
-print("\nConverting parameters...")
+if DO_STATIC_CONVERSION:
+  
+  print("\nConverting parameters...")
 
-dst_path = "Parameters"
-W = model_nobn.get_weights()
-for i, w in enumerate(W):
+  dst_path = "Parameters"
+  W = new_model.get_weights()
+  for i, w in enumerate(W):
     j = i // 2 + 1
     print(w.shape)
     if i % 2 == 0:
-        w.transpose(3, 0, 1, 2).tofile(os.path.join(dst_path, "conv%d_W.bin" % j))
+      w.transpose(3, 0, 1, 2).tofile(os.path.join(dst_path, "conv%d_W.bin" % j))
     else:
-        w.tofile(os.path.join(dst_path, "conv%d_b.bin" % j))
+      w.tofile(os.path.join(dst_path, "conv%d_b.bin" % j))
 
 print("Done!")
 
