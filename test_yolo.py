@@ -106,6 +106,9 @@ def _main(args):
 
     # Generate output tensor targets for filtered bounding boxes.
     # TODO: Wrap these backend operations with Keras layers.
+    test_outputs = yolo_model.output
+    #test_outputs = yolo_model.get_layer("leaky_re_lu_1").output
+
     yolo_outputs = yolo_head(yolo_model.output, anchors, len(class_names))
     input_image_shape = K.placeholder(shape=(2, ))
     boxes, scores, classes = yolo_eval(
@@ -126,26 +129,35 @@ def _main(args):
         if is_fixed_size:  # TODO: When resizing we can use minibatch input.
             resized_image = image.resize(
                 tuple(reversed(model_image_size)), Image.BICUBIC)
-            image_data = np.array(resized_image, dtype='float32')
+            image_data = np.array(resized_image, dtype=K.floatx())
         else:
             # Due to skip connection + max pooling in YOLO_v2, inputs must have
             # width and height as multiples of 32.
             new_image_size = (image.width - (image.width % 32),
                               image.height - (image.height % 32))
             resized_image = image.resize(new_image_size, Image.BICUBIC)
-            image_data = np.array(resized_image, dtype='float32')
+            image_data = np.array(resized_image, dtype=K.floatx())
             print(image_data.shape)
 
         image_data /= 255.
         image_data = np.expand_dims(image_data, 0)  # Add batch dimension.
 
-        out_boxes, out_scores, out_classes = sess.run(
-            [boxes, scores, classes],
+        print("image_data type:",image_data.dtype)
+        print("session run")
+        out_boxes, out_scores, out_classes, out_tests = sess.run(
+            [boxes, scores, classes, test_outputs],
             feed_dict={
                 yolo_model.input: image_data,
                 input_image_shape: [image.size[1], image.size[0]],
                 K.learning_phase(): 0
             })
+        #print("testout: ", test_outputs)
+        print("out_tests: ", out_tests.shape)
+        testout_path = os.path.join(output_path, "result-"+image_file+".floats")
+        out_trans = out_tests.transpose(3, 0, 1, 2).astype("float32")
+        print("out_trans: ", out_trans.shape, out_trans.dtype)
+        #out_tests.tofile(testout_path)
+        out_trans.tofile(testout_path)
         print('Found {} boxes for {}'.format(len(out_boxes), image_file))
 
         font = ImageFont.truetype(

@@ -326,7 +326,23 @@ def yolo_eval(yolo_outputs,
               score_threshold=.6,
               iou_threshold=.5):
     """Evaluate YOLO model on given input batch and return filtered boxes."""
+    print("yolo_eval: score_threshold="+str(score_threshold),"iou_threshold="+str(iou_threshold))
     box_xy, box_wh, box_confidence, box_class_probs = yolo_outputs
+    
+    box_xy = K.cast(box_xy, "float32")
+    box_wh = K.cast(box_wh, "float32")
+    box_confidence = K.cast(box_confidence, "float32")
+    box_class_probs = K.cast(box_class_probs, "float32")
+
+    #box_xy = box_xy.astype("float32")
+    #box_wh = box_wh.astype("float32")
+    #box_confidence = box_confidence.astype("float32")
+    #box_class_probs = box_class_probs.astype("float32")
+    print(box_xy)
+    print(box_wh)
+    print(box_confidence)
+    print(box_class_probs)
+
     boxes = yolo_boxes_to_corners(box_xy, box_wh)
     boxes, scores, classes = yolo_filter_boxes(
         boxes, box_confidence, box_class_probs, threshold=score_threshold)
@@ -336,6 +352,7 @@ def yolo_eval(yolo_outputs,
     width = image_shape[1]
     image_dims = K.stack([height, width, height, width])
     image_dims = K.reshape(image_dims, [1, 4])
+    image_dims = K.cast(image_dims, "float32")
     boxes = boxes * image_dims
 
     # TODO: Something must be done about this ugly hack!
@@ -346,6 +363,7 @@ def yolo_eval(yolo_outputs,
     boxes = K.gather(boxes, nms_index)
     scores = K.gather(scores, nms_index)
     classes = K.gather(classes, nms_index)
+    print("Returning",boxes, scores, classes)
     return boxes, scores, classes
 
 
