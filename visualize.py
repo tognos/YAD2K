@@ -4,6 +4,7 @@ import argparse
 import os
 import numpy as np
 import glob
+import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(description='compare .float binary files')
 parser.add_argument('dir1', help='path to directory containing .float files')
@@ -51,15 +52,7 @@ def compare_features_fast(features1, features2):
   error = np.abs(features1 - features2) 
   max_error = np.max(error)
   avrg_error = np.sum(error)/features1.size
-  min_1 = np.min(features1)
-  min_2 = np.min(features2)
-  max_1 = np.max(features1)
-  max_2 = np.max(features2)
-  avrg_1 = np.sum(features1)/features1.size
-  avrg_2 = np.sum(features2)/features2.size
   print("error max:",max_error,"avrg:",avrg_error)
-  print("avrg1:",avrg_1,"min1:",min_1,"max1:", max_1)
-  print("avrg2:",avrg_2,"min2:",min_2,"max2:",max_2)
 
 
 def compare_features_(features1, features2):
@@ -72,12 +65,48 @@ def compare_features_(features1, features2):
           min_j = j
     print(i,"->",min_j, " min_error=",min_error)
 
+def vis_square(data):
+  """Take an array of shape (n, height, width) or (n, height, width, 3)
+  and visualize each (height, width) thing in a grid of size approx. sqrt(n) by sqrt(n)"""
+  
+  # normalize data for display
+  data = (data - data.min()) / (data.max() - data.min())
+  # force the number of filters to be square
+  n = int(np.ceil(np.sqrt(data.shape[0])))
+  padding = (((0, n ** 2 - data.shape[0]),
+        (0, 1), (0, 1))                 # add some space between filters
+      + ((0, 0),) * (data.ndim - 3))  # don't pad the last dimension (if there is one)
+  data = np.pad(data, padding, mode='constant', constant_values=1)  # pad with ones (white)
+  # tile the filters into an image
+  data = data.reshape((n, n) + data.shape[1:]).transpose((0, 2, 1, 3) + tuple(range(4, data.ndim + 1)))
+  data = data.reshape((n * data.shape[1], n * data.shape[3]) + data.shape[4:])
+  plt.imshow(data); plt.axis('off')
+  print("visualized")
+
+def visualize(data):
+  print("visualizing")
+  data = data.reshape(425,19,19)
+  print("data:", data.shape)
+  vis_square(data)
+  plt.show()
+
+def visualize2(data1, data2):
+  print("visualizing")
+  fig = plt.figure()
+  a=fig.add_subplot(1,2,1)
+  vis_square(data1)
+  a=fig.add_subplot(1,2,2)
+  vis_square(data2)
+  plt.show()
 
 
 def check(file1, file2):
   print("Checking "+file1+" and "+file2)
   data1 = np.fromfile(file1, dtype = np.float32)
   data2 = np.fromfile(file2, dtype = np.float32)
+  visualize2(data1.reshape(425,19,19),data2.reshape(425,19,19))
+  #visualize2(data1.reshape(32,608,608),data2.reshape(32,608,608))
+  exit(0)
   #compare_features_min(data1, data2)
   compare_features_fast(data1, data2)
 
@@ -104,7 +133,5 @@ def _main(args):
         if base in dir1_names:
           check(dir1_names[base], path)
       
-    
-
 if __name__ == '__main__':
       _main(parser.parse_args())

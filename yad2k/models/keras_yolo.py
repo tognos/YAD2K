@@ -334,14 +334,10 @@ def yolo_eval(yolo_outputs,
     box_confidence = K.cast(box_confidence, "float32")
     box_class_probs = K.cast(box_class_probs, "float32")
 
-    #box_xy = box_xy.astype("float32")
-    #box_wh = box_wh.astype("float32")
-    #box_confidence = box_confidence.astype("float32")
-    #box_class_probs = box_class_probs.astype("float32")
-    print(box_xy)
-    print(box_wh)
-    print(box_confidence)
-    print(box_class_probs)
+    print("box_xy",box_xy)
+    print("box_wh",box_wh)
+    print("box_confidence",box_confidence)
+    print("box_class_probs",box_class_probs)
 
     boxes = yolo_boxes_to_corners(box_xy, box_wh)
     boxes, scores, classes = yolo_filter_boxes(

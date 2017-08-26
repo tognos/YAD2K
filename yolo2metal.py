@@ -32,10 +32,22 @@ from keras import layers
 
 import copy
 
+DEBUG_OUT = True
+MORE_DEBUG_OUT = False
+
+def dprint(*args, **kwargs):
+  if DEBUG_OUT:
+    print(*args, **kwargs)
+
+def ddprint(*args, **kwargs):
+  if MORE_DEBUG_OUT:
+    print(*args, **kwargs)
+
+
 def fold_batch_norm(conv_layer, bn_layer):
     """Fold the batch normalization parameters into the weights for 
        the previous layer."""
-    #print("Folding bn "+bn_layer.__class__.__name__+":"+str(bn_layer.get_config())+" into conv "+conv_layer.__class__.__name__+":"+str(conv_layer.get_config())+"\n")
+    ddprint("Folding bn "+bn_layer.__class__.__name__+":"+str(bn_layer.get_config())+" into conv "+conv_layer.__class__.__name__+":"+str(conv_layer.get_config())+"\n")
     conv_weights = conv_layer.get_weights()[0]
 
     # Keras stores the learnable weights for a BatchNormalization layer
@@ -67,10 +79,11 @@ prev_layer = None
 prev_prev_layer = None
 new_weights = []
 
-print("Creating optimized model\n")
+print("Creating optimized model (with batchnorm folding):\n")
 
+# returns a dict mapping all layer names to arrays with the names of their inbound layers
+# layers with no inbound layers map to an empty array
 def find_inbound_layers(model):
-
   model_config = model.get_config()
   layers_config = model_config['layers']
 
@@ -85,30 +98,39 @@ def find_inbound_layers(model):
       inbound_node_list = inbound_nodes[0]
       for node in inbound_node_list:
         inbound_names.append(node[0])
-      print("Layer name:"+layer_name+": Inbound:"+str(inbound_names))
+      dprint("Layer name:"+layer_name+": Inbound:"+str(inbound_names))
     else:
-      print("Layer name:"+layer_name+": No inbound layers")
+      dprint("Layer name:"+layer_name+": No inbound layers")
     inbound_layer_by_name[layer_name] = inbound_names
   return inbound_layer_by_name
 
 
 import json
-print(json.dumps(model.get_config(),sort_keys=True, indent=4))
+ddprint(json.dumps(model.get_config(),sort_keys=True, indent=4))
 
-
+#convenience function returning the name of a layer from the config
 def layer_name(layer):
   return layer.get_config()['name']
 
+# In Keras the only way to clone a layer (without the weights)
+# is to serialize and deserialize the layer config
+# This function does that
 def layer_clone(layer):
   return layers.deserialize({'class_name': layer.__class__.__name__,
                                     'config': layer.get_config()})
 
+# returns a a replacement for a the_name if it is in the
+# replacements dict; otherwise, the_name is returned
+# This is used to reference the correct layers
+# when they have been optimized away
 def replaced_name(the_name, replacements):
   if the_name in replacements:
     return replacements[the_name]
   else:
     return the_name
 
+# returns an array of names that might have been replaced
+# by the function above
 def replaced_name_list(the_names, replacements):
   result = []
   for name in the_names:
@@ -118,7 +140,7 @@ def replaced_name_list(the_names, replacements):
 # return output blobs of inbound layers to layer_by_name
 def input_layers_outputs(inbound_names, layer_by_name):
   #print("input_layers_outputs: inbound_names: "+str(inbound_names)+", all="+str(layer_by_name))
-  print("input_layers_outputs: inbound_names: "+str(inbound_names))
+  ddprint("input_layers_outputs: inbound_names: "+str(inbound_names))
   if len(inbound_names) == 1:
     result = layer_by_name[inbound_names[0]]
     #print("input_layers_outputs: returning single result: "+str(result))
@@ -145,66 +167,88 @@ def orig_input_layers(inbound_names, model):
 
 inbound_by_name = find_inbound_layers(model)
 
-layer_by_name = {}
+# dict all layers by name for the new model
+layer_by_name = {} 
+
+# dict of all weights by layer name for the new model
 weights_by_name = {}
+
+# dict of the output blob of a new layer by name
 output_by_name = {}
+
+# dict of layer names that have been optimized away
+# so that layers referencing these layers
+# can reference the output of the remaining layer
 replaced_layer = {}
 
+# register a new layer and its output blob in
+# above global dicts
 def register_new_layer(the_name, the_layer, the_output):
   all_layers.append(the_output)
   layer_by_name[the_name] = the_layer
   output_by_name[the_name] = the_output
 
-
-
+# iterate over all layers of the original model
 for index, layer in enumerate(model.layers):
   #print("\n"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
-  print(str(index)+":"+layer.__class__.__name__+":"+layer_name(layer))
+  dprint(str(index)+":"+layer.__class__.__name__+":"+layer_name(layer))
 
+  # get names of the inbound layers of our current layer
   inbounds = replaced_name_list(inbound_by_name[layer_name(layer)], replaced_layer)
-  print("Inbounds:"+str(inbounds)+", len "+str(len(inbounds)))
+  dprint("Inbounds:"+str(inbounds)+", len "+str(len(inbounds)))
 
   if len(inbounds) == 0:
-    # create an input layer
+    # layer has no inbounds, so we assume it is an input layer
+    # and create a new input layer
     batch_input_shape = layer.get_config()['batch_input_shape']
     input_shape = batch_input_shape[1:]
-    print(str(input_shape), str(batch_input_shape))
+    dprint(str(input_shape), str(batch_input_shape))
     new_layer = Input(shape=input_shape)
+    # Note: new_layer is actually the blob output of the input
     register_new_layer(layer_name(layer), new_layer, new_layer)
   else:
+    # the layer has at least one input
     orig_inputs = orig_input_layers(inbounds, model)
     #print("orig_inputs:"+str(orig_inputs))
     if not layer.get_weights():
-      print("Layer '"+layer.__class__.__name__+" has no weights")
+      # layer has no weights, so we just clone it and instantiate
+      # and connect it using the keras functional API
+      dprint("Layer '"+layer.__class__.__name__+" has no weights")
       new_layer = layer_clone(layer)
       inputs = input_layers_outputs(inbounds, output_by_name)
       register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
     else:
+      # layer has weights, so we might have to do some optimization
       weight_shape = np.shape(layer.get_weights())
-      print("Layer '"+layer.__class__.__name__+" weight shape:"+str(weight_shape))
+      dprint("Layer '"+layer.__class__.__name__+" weight shape:"+str(weight_shape))
       layer_done = False
       #print("orig_inputs:"+str(orig_inputs)+", class "+str(orig_inputs.__class__))
       #print("BNTEST:"+layer.__class__.__name__ +" "+ orig_inputs.__class__.__name__)
       
       if layer.__class__.__name__ == "BatchNormalization" and orig_inputs.__class__.__name__ == "Conv2D":
-        # batchnorm following a conv2D layer, set folded weights for previous conv layer
-        print("Folding batch norm layer")
+        # batchnorm following a conv2D layer
+        # we need to set folded weights for the previous conv layer
+        # which also has not been created yet
+        dprint("Folding batch norm layer")
         prev_orig_layer = orig_input_layers(inbounds, model)
         new_config = prev_orig_layer.get_config()
+        # we need our new conv layer to have bias
         new_config['use_bias'] = True
+        # create a conv layer
         new_layer = layers.deserialize({'class_name': prev_orig_layer.__class__.__name__,
                                   'config': new_config})
         prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
         inputs = input_layers_outputs(prev_inbounds, output_by_name)
         register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
-        print("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
+        dprint("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
         weights_by_name[layer_name(new_layer)] = fold_batch_norm(prev_orig_layer, layer)
+        # add the name of the new layer as a replacement for the folded batchnorm layer
         replaced_layer[layer_name(layer)] = layer_name(prev_orig_layer)
         layer_done = True
       else:
         if orig_inputs.__class__.__name__ == "Conv2D":
           # conv without following batchnorm, set normal weights for previous conv layer
-          print("Conv2d layer without following batchnorm")
+          dprint("Conv2d layer without following batchnorm")
           prev_orig_layer = model.get_layer(name=orig_inputs)
           new_layer = layer_clone(prev_orig_layer)
           prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
@@ -218,16 +262,20 @@ for index, layer in enumerate(model.layers):
           new_layer = layer_clone(layer)
           inputs = input_layers_outputs(inbounds, output_by_name)
           register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
-          print("appending new layer:"+new_layer.__class__.__name__)
-          print("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
+          dprint("appending new layer:"+new_layer.__class__.__name__)
+          dprint("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
           weights_by_name[layer_name(layer)] = layer.get_weights()
-          #print("adding weights for new layer type " + all_layers[-1].__class__.__name__)
 
+# create our new model using the keras functional API
 new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
 new_model.summary()
 
-print(str(replaced_layer))
+ddprint("Replaced layers:"+str(replaced_layer))
 
+# now actually set the weights for the new model layers
+# we have to do it after model instantiation because
+# the keras could not calculate the actual shapes
+# before the model was completely set up
 for layer_name_, weights in weights_by_name.items():
   print("Setting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
   #print("weights     :"+str(np.shape(weights)))
@@ -331,8 +379,9 @@ class_of_layer = {}
 
 for layer in new_model.layers:
   class_of_layer[layer_name(layer)] = layer.__class__.__name__
- 
 
+# transforms a dict of lists of inbounds layer names into a
+# dict of lists of outbound destination names
 def outbound_layers(inbound_layers_by_name):
   outbound = {}
   for name, inbounds in inbound_layers_by_name.items():
@@ -345,6 +394,10 @@ def outbound_layers(inbound_layers_by_name):
       outbound[name] = []
   return outbound
 
+# returns a dictionary of the LeakyReLUs layers in the new keras model
+# and the correspondig Conv layers with leaky activations that shall
+# be referenced in the metal model instead because there is no need
+# for LeakyReLUs in the metal model
 def replaced_leakyReLUs(inbound_by_name, model):
   replacements = {}
   for index, layer in enumerate(model.layers):
@@ -355,6 +408,8 @@ def replaced_leakyReLUs(inbound_by_name, model):
         replacements[layer_name(layer)] = layer_name(inbound_layer)
   return replacements
 
+# returns a map to list of connections (can be names of inputs or outputs) that 
+# take the places of the gone leaky relus in the new topology for metal
 def collapsed_layers(connections, replacements):
   result = {}
   for layer, edges in connections.items():
@@ -368,21 +423,25 @@ def collapsed_layers(connections, replacements):
 
   return result
 
+# set up various maps to help with our new metal network topology
 orig_inbound_by_name = find_inbound_layers(new_model)
-print("orig_inbound_by_name:"+str(orig_inbound_by_name))
-print()
+dprint("orig_inbound_by_name:"+str(orig_inbound_by_name))
+dprint()
 replaced_layers = replaced_leakyReLUs(orig_inbound_by_name, new_model)
-print("replaced_layers:"+str(replaced_layers))
-print()
+dprint("replaced_layers:"+str(replaced_layers))
+dprint()
 inbound_by_name = collapsed_layers(orig_inbound_by_name, replaced_layers)
-print("inbound_by_name:"+str(inbound_by_name))
-print(json.dumps(inbound_by_name ,sort_keys=True, indent=4))
-print()
+dprint("inbound_by_name:")
+dprint(json.dumps(inbound_by_name ,sort_keys=True, indent=4))
+dprint()
 outbound_by_name = outbound_layers(inbound_by_name)
-print("outbound_by_name:"+str(outbound_by_name))
-print(json.dumps(outbound_by_name ,sort_keys=True, indent=4))
-print()
+dprint("outbound_by_name:")
+dprint(json.dumps(outbound_by_name ,sort_keys=True, indent=4))
+dprint()
 
+
+# filters 
+#
 def filter_duplicates(existing, new):
   result = []
   for section in new:
@@ -394,37 +453,79 @@ def filter_duplicates(existing, new):
       result.append(section)
   return result
 
+#
+# Note: The following code that creates the swift source is not well tested,
+# and might fail for special topologies, and there may be better ways to do that,
+# but it does the job for yolo
+#
+
+# This function traverses the net recursively building chains
+# of layers that start and end at points where the graph splits
+# or joins because we need to reference layers with multiple
+# outputs when we functionally build the Forge graph
+# We also need to gather inputs for concatenate layers separately
+# because the DSL has different signature when concatenating
+#
+# The returned result will be an array of sections
+# Each section is a list with four element:
+# - A string tag that is either "CHAIN" or "CONCAT"
+# - a start name
+# - an end name
+# - an array of the layer names that form the chain or input
+#
+# Each chain is uniquely identfied by the first three elements
+# (tag, start name, end name)
+#
+# The recursive traversal can create duplicates which are simply
+# filtered out during the traversal
+#
 def chain_layers(start_name, inbound_by_name, outbound_by_name):
   current = start_name
   result = []
   links = []
   end = False
+  # iterate along connections where the layer has only one output and
+  # and no more than one input
   while not end and len(outbound_by_name[current]) == 1 and\
         (len(inbound_by_name[current]) <= 1 or
         current == start_name):
     if current == start_name and len(inbound_by_name[current]) == 1:
+      # When we start the chain, reference the input layer 
+      # to the chain if there is one 
       links.append(inbound_by_name[current][0])
+   
     links.append(current)
+    
     if len(outbound_by_name[current]) > 0:
+      # advance when there is another output
       current = outbound_by_name[current][0]
     else:
+      # stop iterating when there is no output connection
       end = True
+
+  # We are done with gathering the elements (links) for the sectionn
   if class_of_layer[current] != "Concatenate": 
+    # We stopped at a concat layer, but is has not been yet added
+    # because Python does not have do..while loops
     links.append(current)
-  section = ("chain", start_name, links[-1], links)
+
+  # add a "CHAIN" section
+  section = ("CHAIN", start_name, links[-1], links)
   result.extend(filter_duplicates(result, [section]))
   if len(outbound_by_name[current]) > 1:
+    # we have more than one one outbound connection, follow them all recursively
     for out in outbound_by_name[current]:
       result.extend(filter_duplicates(result, chain_layers(out, inbound_by_name, outbound_by_name)))
 
   if len(inbound_by_name[current]) > 1:
-    section = ("concat", current, current, inbound_by_name[current])
+    # we have more that one input, so we create a "CONCAT" section
+    section = ("CONCAT", current, current, inbound_by_name[current])
     result.append(section)
     result.extend(filter_duplicates(result,chain_layers(current, inbound_by_name, outbound_by_name)))
 
   return result
 
-
+# find layers without connections
 def find_inout(inoutbound_by_name):
   results = []
   for key, inoutbounds in inoutbound_by_name.items():
@@ -435,12 +536,15 @@ def find_inout(inoutbound_by_name):
 input_layers = find_inout(inbound_by_name)
 output_layers = find_inout(outbound_by_name)
 
-print("Input layers:"+str(input_layers))
-print("Output layers:"+str(output_layers))
+dprint("Input layers:"+str(input_layers))
+dprint("Output layers:"+str(output_layers))
 
+# compute all our sections
 raw_sections = chain_layers(input_layers[0], inbound_by_name, outbound_by_name)
 #print(json.dumps(raw_sections ,sort_keys=False, indent=4))
 
+# returns a list of all sections that will have to be defined
+# as referenceable constants
 def defined_sections(sections):
   result = []
   for section in sections:
@@ -448,8 +552,11 @@ def defined_sections(sections):
   return result 
 
 defined = defined_sections(raw_sections)
-print("defined = "+str(defined))
+dprint("defined = "+str(defined))
 
+# return a dict containing a list of names that are referenced
+# by a each section; the third item in the section "head"
+# acts as name for a section
 def referencing_sections(sections):
   result = {}
   for referencing_section in sections:
@@ -458,20 +565,29 @@ def referencing_sections(sections):
       if reference in defined and reference != referencing_section[2]:
         referencing.append(reference)
     result[referencing_section[2]] = referencing
-    #print(referencing_section[2]+" is referencing "+str(referencing))
+    dprint(referencing_section[2]+" is referencing "+str(referencing))
     #print("result ="+str(result))
   return result
 
+# The sections generated by our "chain_sections()" traversal are not
+# necessarily in the order we need them to declare them,
+# so we may have to sort them
 def sort_sections(sections):
   referencing = referencing_sections(raw_sections)
 
   order = []
+
+  # find sections that do not reference others 
+  # and therefore can be declared first
   for name in referencing:
     if len(referencing[name]) == 0:
       order.append(name)
 
-  print("order="+str(order))
+  dprint("Sections not referencing any other section:="+str(order))
 
+  # repeat iterating over all sections that reference others,
+  # adding every section that has all its referecens already
+  # satisfied until we can't add a new section
   changed = True
   while changed:
     changed = False
@@ -489,8 +605,12 @@ def sort_sections(sections):
           #print("order="+str(order))
           changed = True
 
+  # We could not add any more sections, so we should have sorted them all
+  # if not, we can't do anything better
   assert len(order) == len(sections), "Could not resolve all references"
 
+  # so far we only gather section names by order, now bring the sections
+  # in order
   result = []
   for name in order:
     for section in sections:
@@ -504,9 +624,16 @@ referencing = referencing_sections(raw_sections)
 
 sections = sort_sections(raw_sections)
 #sections = raw_sections
-print("SORTED::::::::::::::::::::")
-print(json.dumps(sections ,sort_keys=False, indent=4))
-#generate swift source for forge network code
+dprint("SORTED::::::::::::::::::::")
+dprint(json.dumps(sections ,sort_keys=False, indent=4))
+
+# stub for keras -> metal activation function translation
+def translated_activation(activation):
+  translation = {"linear":"nil"}
+  assert  activation in translation, "Unknown activation:"+activation
+  return translation[activation]
+
+#generate swift source for Forge network code
 '''
 public init(kernel: (Int, Int),
     channels: Int,
@@ -520,8 +647,7 @@ def conv2DSource(kernel, channels, stride, padding, activation, useBias, name):
 #Convolution(kernel: (3, 3), channels: 16, activation: leaky, name: "conv1")
   line = 'let {} = Convolution(kernel: ({}, {}), channels: {}, stride: ({}, {}), padding: .{},'\
          ' activation: {}, name: "{}")'.format(name, kernel[0], kernel[1], channels, stride[0],
-         stride[1], padding, "leaky", name)
-         #stride[1], padding, activation, name)
+         stride[1], padding, activation, name)
   print(line)
   return line
 
@@ -545,8 +671,13 @@ def conv2DsourceFromConfig(layer):
   cfg = layer.get_config()
   
   #print(json.dumps(config ,sort_keys=True, indent=4))
+  activation = cfg["activation"]
+  if layer_name(layer) in replaced_layers.values():
+    activation = "leaky"
+  else:
+    activation = translated_activation(activation)
   return conv2DSource(cfg["kernel_size"], cfg["filters"], cfg["strides"], cfg["padding"],
-                      cfg["activation"], cfg["use_bias"], layer_name(layer))
+                      activation, cfg["use_bias"], layer_name(layer))
 
 def maxPoolsourceFromConfig(layer):
   cfg = layer.get_config()
@@ -564,7 +695,6 @@ class_of_layer = {}
 swift_src.append("let leaky = MPSCNNNeuronReLU(device: device, a: 0.1)")
 for input_name in input_layers:
   swift_src.append("let input = Input()")
-  #swift_src.append("let {} = input --> Resize(width: 608, height: 608)".format(input_name))
   swift_src.append("let {} = input --> Resize(width: {}, height: {})"\
                   .format(input_name, batch_input_shape[1], batch_input_shape[2]))
   swift_src.append("")
@@ -587,7 +717,7 @@ swift_src.append("")
 swift_src.append("do {")
 
 for section in sections:
-  if (section[0] == "chain"):
+  if (section[0] == "CHAIN"):
     var_name = section[2]
     line = "let "+var_name + " = "
     for index, layer_id in enumerate(section[3]):
@@ -595,7 +725,7 @@ for section in sections:
       if index < len(section[3])-1:
         line += " --> "
     swift_src.append(line)
-  elif section[0] == "concat":
+  elif section[0] == "CONCAT":
     var_name = section[1]
     line = "let "+var_name + " = Concatenate(["
     for index, layer_id in enumerate(section[3]):
