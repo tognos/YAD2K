@@ -25,15 +25,46 @@ import os
 import numpy as np
 import keras
 from keras.models import Sequential, load_model
-from keras.layers import Conv2D, MaxPooling2D, Input
-from keras.layers.advanced_activations import LeakyReLU
+from keras.layers import Conv2D, MaxPooling2D, Input, Activation
+from keras.layers.advanced_activations import LeakyReLU, ELU, ThresholdedReLU
 from keras.models import Model
 from keras import layers
+
+from keras.applications.inception_v3 import InceptionV3
 
 import copy
 
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
+
+#MODEL="YOLO"
+MODEL="TINY_YOLO"
+#MODEL="INCEPTION_V3"
+
+if MODEL == "YOLO":
+  model_path = "model_data/yolo.h5"
+  model = load_model(model_path)
+
+if MODEL == "TINY_YOLO":
+  model_path = "model_data/tiny-yolo-voc.h5"
+  model = load_model(model_path)
+
+if MODEL=="INCEPTION_V3":
+  model_path = "model_data/inception_v3.h5"
+  model = InceptionV3(weights='imagenet')
+  model.save(model_path)
+
+def file_name_plus(path_name, name_extension):
+  path_file, extension = os.path.splitext(path_name)
+  return path_file + name_extension + extension
+
+def changed_extension(path_name, new_extension):
+  path_file, extension = os.path.splitext(path_name)
+  return path_file + new_extension
+
+model.summary()
+from keras.utils import plot_model
+plot_model(model, to_file=changed_extension(model_path,'.png'))
 
 def dprint(*args, **kwargs):
   if DEBUG_OUT:
@@ -43,11 +74,19 @@ def ddprint(*args, **kwargs):
   if MORE_DEBUG_OUT:
     print(*args, **kwargs)
 
+def dddprint(*args, **kwargs):
+  if False:
+    print(*args, **kwargs)
+
+
+import json
+def pretty(the_dict):
+  return json.dumps(the_dict,sort_keys=True, indent=4)
 
 def fold_batch_norm(conv_layer, bn_layer):
     """Fold the batch normalization parameters into the weights for 
        the previous layer."""
-    ddprint("Folding bn "+bn_layer.__class__.__name__+":"+str(bn_layer.get_config())+" into conv "+conv_layer.__class__.__name__+":"+str(conv_layer.get_config())+"\n")
+    dddprint("Folding bn "+bn_layer.__class__.__name__+":\n"+pretty(bn_layer.get_config())+"\ninto conv "+conv_layer.__class__.__name__+":i\n"+pretty(conv_layer.get_config())+"\n")
     conv_weights = conv_layer.get_weights()[0]
 
     # Keras stores the learnable weights for a BatchNormalization layer
@@ -57,22 +96,29 @@ def fold_batch_norm(conv_layer, bn_layer):
     #   2 = moving mean
     #   3 = moving variance
     bn_weights = bn_layer.get_weights()
-    gamma = bn_weights[0]
-    beta = bn_weights[1]
-    mean = bn_weights[2]
-    variance = bn_weights[3]
+    next_index = 0
+    if bn_layer.scale:
+      dprint("batch_norm has scale (gamma)")
+      gamma = bn_weights[next_index]
+      next_index += 1
+    else:
+      gamma = 1.0
+    if bn_layer.center:
+      dprint("batch_norm has center (beta)")
+      beta = bn_weights[next_index]
+      next_index += 1
+    else:
+      beta = 0
+
+    mean = bn_weights[next_index]
+    variance = bn_weights[next_index + 1]
+
+    dprint("bn_weights.shape="+str(np.shape(bn_weights)))
     
-    epsilon = 1e-3
+    epsilon = float(bn_layer.get_config()['epsilon'])
     new_weights = conv_weights * gamma / np.sqrt(variance + epsilon)
     new_bias = beta - mean * gamma / np.sqrt(variance + epsilon)
     return new_weights, new_bias
-
-#model_path = "model_data/tiny-yolo-voc.h5"
-model_path = "model_data/yolo.h5"
-
-# Load the model that was exported by YAD2K.
-model = load_model(model_path)
-model.summary()
 
 all_layers = []
 prev_layer = None
@@ -105,7 +151,6 @@ def find_inbound_layers(model):
   return inbound_layer_by_name
 
 
-import json
 ddprint(json.dumps(model.get_config(),sort_keys=True, indent=4))
 
 #convenience function returning the name of a layer from the config
@@ -269,6 +314,7 @@ for index, layer in enumerate(model.layers):
 # create our new model using the keras functional API
 new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
 new_model.summary()
+plot_model(new_model, to_file=changed_extension(file_name_plus(model_path,'_new'),'.png'))
 
 ddprint("Replaced layers:"+str(replaced_layer))
 
@@ -281,7 +327,6 @@ for layer_name_, weights in weights_by_name.items():
   #print("weights     :"+str(np.shape(weights)))
   #print("orig_weights:"+str(np.shape(layer_by_name[layer_name_].get_weights())))
   layer_by_name[layer_name_].set_weights(weights)
-
 
 # The original model has batch normalization layers. We will now create
 # a new model without batch norm. We will fold the parameters for each
@@ -380,6 +425,44 @@ class_of_layer = {}
 for layer in new_model.layers:
   class_of_layer[layer_name(layer)] = layer.__class__.__name__
 
+
+# returns a set of activations
+def gather_activations(model):
+  activations = set() 
+  params_of_activation = {}
+  activation_of_layer = {} 
+  for index, layer in enumerate(model.layers):
+    params = []
+    if "activation" in layer.get_config():
+      activation = layer.get_config()['activation']
+      activations.add(activation)
+      activation_of_layer[layer_name(layer)] = activation
+      if activation == "linear":
+        params = {"metal_func": "nil",
+                  "swift_prefix": "none"}
+      elif activation == "relu":
+        params = {"metal_func": "MPSCNNNeuronReLU(device: device, a: 0)",
+                  "swift_prefix": "relu"}
+      params_of_activation[activation] = params
+    elif type(layer) in [LeakyReLU, ELU]:
+      param = float(layer.get_config()['alpha'])
+      activation = "{}(alpha={:.5f})".format(layer.__class__.__name__,param)
+      activations.add(activation)
+      activation_of_layer[layer_name(layer)] = activation
+      if type(layer) == LeakyReLU:
+        params = {"metal_func": "MPSCNNNeuronReLU(device: device, a: {:.5f})".format(param),
+                  "swift_prefix": "leaky"}
+      elif type(layer) == ELU:
+        params = {"metal_func": "MPSCNNNeuronELU(device: device, a: {:.5f})".format(param),
+                  "swift_prefix": "elu"}
+      params_of_activation[activation] = params
+  return activations, params_of_activation, activation_of_layer
+
+activations, params_of_activation, activation_of_layer = gather_activations(new_model)
+dprint("activations:"+str(activations))
+dprint("params_of_activation:"+pretty(params_of_activation))
+dprint("activation_of_layer:"+pretty(activation_of_layer))
+
 # transforms a dict of lists of inbounds layer names into a
 # dict of lists of outbound destination names
 def outbound_layers(inbound_layers_by_name):
@@ -394,10 +477,10 @@ def outbound_layers(inbound_layers_by_name):
       outbound[name] = []
   return outbound
 
-# returns a dictionary of the LeakyReLUs layers in the new keras model
-# and the correspondig Conv layers with leaky activations that shall
-# be referenced in the metal model instead because there is no need
-# for LeakyReLUs in the metal model
+# returns a dictionary of the activation layers in the new keras model
+# and the correspondig Conv layers with activations that shall
+# be referenced in the metal model instead because in manny case there
+# is no need for separate activation in the metal model
 def replaced_leakyReLUs(inbound_by_name, model):
   replacements = {}
   for index, layer in enumerate(model.layers):
@@ -407,6 +490,18 @@ def replaced_leakyReLUs(inbound_by_name, model):
       if inbound_layer.__class__.__name__ == "Conv2D":
         replacements[layer_name(layer)] = layer_name(inbound_layer)
   return replacements
+
+def replaced_activation_layers(inbound_by_name, model):
+  replacements = {}
+  for index, layer in enumerate(model.layers):
+    if type(layer) in [LeakyReLU, ELU, Activation] and\
+      'swift_prefix' in params_of_activation[activation_of_layer[layer.name]]:
+      inbound = inbound_by_name[layer_name(layer)][0]
+      inbound_layer = model.get_layer(inbound)
+      if type(inbound_layer) == Conv2D:
+        replacements[layer_name(layer)] = layer_name(inbound_layer)
+  return replacements
+
 
 # returns a map to list of connections (can be names of inputs or outputs) that 
 # take the places of the gone leaky relus in the new topology for metal
@@ -427,18 +522,24 @@ def collapsed_layers(connections, replacements):
 orig_inbound_by_name = find_inbound_layers(new_model)
 dprint("orig_inbound_by_name:"+str(orig_inbound_by_name))
 dprint()
-replaced_layers = replaced_leakyReLUs(orig_inbound_by_name, new_model)
+
+replaced_layers = replaced_activation_layers(orig_inbound_by_name, new_model)
 dprint("replaced_layers:"+str(replaced_layers))
 dprint()
+
+# key-value reversed version of replaced_layers
+original_activation_layer_of = {v:k for k,v in replaced_layers.items()}
+dprint("original_activation_layer_of:"+str(original_activation_layer_of))
+
 inbound_by_name = collapsed_layers(orig_inbound_by_name, replaced_layers)
 dprint("inbound_by_name:")
-dprint(json.dumps(inbound_by_name ,sort_keys=True, indent=4))
-dprint()
-outbound_by_name = outbound_layers(inbound_by_name)
-dprint("outbound_by_name:")
-dprint(json.dumps(outbound_by_name ,sort_keys=True, indent=4))
+dprint(pretty(inbound_by_name))
 dprint()
 
+outbound_by_name = outbound_layers(inbound_by_name)
+dprint("outbound_by_name:")
+dprint(pretty(outbound_by_name))
+dprint()
 
 # filters 
 #
@@ -453,77 +554,69 @@ def filter_duplicates(existing, new):
       result.append(section)
   return result
 
-#
-# Note: The following code that creates the swift source is not well tested,
-# and might fail for special topologies, and there may be better ways to do that,
-# but it does the job for yolo
-#
+class ChainSection(dict):
+  def __init__(self, name, layers):
+    self.name = name
+    self.layers = layers
+    dict.__init__(self, name=name, layers=layers)
+    dddprint("New ChainSection:"+pretty(self))
+
+class ConcatSection(dict):
+  def __init__(self, name, inputs):
+    self.name = name
+    self.layers = inputs
+    dict.__init__(self, name=name, inputs=inputs)#
+    dddprint("New ConcatSection:"+pretty(self))
 
 # This function traverses the net recursively building chains
 # of layers that start and end at points where the graph splits
 # or joins because we need to reference layers with multiple
 # outputs when we functionally build the Forge graph
 # We also need to gather inputs for concatenate layers separately
-# because the DSL has different signature when concatenating
+# because the DSL has a different signature when concatenating
 #
 # The returned result will be an array of sections
-# Each section is a list with four element:
-# - A string tag that is either "CHAIN" or "CONCAT"
-# - a start name
-# - an end name
-# - an array of the layer names that form the chain or input
+# Each section is either a ChainSection or ConcatSection with a name
+# that corresponds to the output of the chain and
+# ann array of layers that make up the chain or
+# shall be concatenated
 #
-# Each chain is uniquely identfied by the first three elements
-# (tag, start name, end name)
-#
-# The recursive traversal can create duplicates which are simply
-# filtered out during the traversal
-#
-def chain_layers(start_name, inbound_by_name, outbound_by_name):
-  current = start_name
-  result = []
-  links = []
+def chain_layers(start_name, inbound_by_name, outbound_by_name, sections, current_chain,visited=set()):
+  dddprint("chain_layers: check chain starting at '"+start_name+"'")
+  dddprint("chain_layers: visited '"+str(visited)+"'")
+  if start_name in visited:
+    dddprint("chain_layers: already visited chain starting at '"+start_name+"'")
+    return
+  visited.add(start_name)
   end = False
-  # iterate along connections where the layer has only one output and
-  # and no more than one input
-  while not end and len(outbound_by_name[current]) == 1 and\
-        (len(inbound_by_name[current]) <= 1 or
-        current == start_name):
-    if current == start_name and len(inbound_by_name[current]) == 1:
-      # When we start the chain, reference the input layer 
-      # to the chain if there is one 
-      links.append(inbound_by_name[current][0])
-   
-    links.append(current)
-    
-    if len(outbound_by_name[current]) > 0:
-      # advance when there is another output
-      current = outbound_by_name[current][0]
-    else:
-      # stop iterating when there is no output connection
+  current = start_name
+  while not end:
+    dddprint("chain_layers: current: '"+current+"'")
+    if len(inbound_by_name[current]) > 1:
+      # we have more that one input, so we add a concat section
+      sections[current] = ConcatSection(current, inbound_by_name[current])
+      end = True # a concat section also needs the output so the chain ends here
+      # continue now chains
+      for output in outbound_by_name[current]:
+        chain_layers(output, inbound_by_name, outbound_by_name, sections, [current], visited)
+    elif len(outbound_by_name[current]) > 1:
+      # section is referenced by more than one layer, so the chain also ends
+      sections[current] = ChainSection(current, current_chain)
       end = True
-
-  # We are done with gathering the elements (links) for the sectionn
-  if class_of_layer[current] != "Concatenate": 
-    # We stopped at a concat layer, but is has not been yet added
-    # because Python does not have do..while loops
-    links.append(current)
-
-  # add a "CHAIN" section
-  section = ("CHAIN", start_name, links[-1], links)
-  result.extend(filter_duplicates(result, [section]))
-  if len(outbound_by_name[current]) > 1:
-    # we have more than one one outbound connection, follow them all recursively
-    for out in outbound_by_name[current]:
-      result.extend(filter_duplicates(result, chain_layers(out, inbound_by_name, outbound_by_name)))
-
-  if len(inbound_by_name[current]) > 1:
-    # we have more that one input, so we create a "CONCAT" section
-    section = ("CONCAT", current, current, inbound_by_name[current])
-    result.append(section)
-    result.extend(filter_duplicates(result,chain_layers(current, inbound_by_name, outbound_by_name)))
-
-  return result
+      for output in outbound_by_name[current]:
+        chain_layers(output, inbound_by_name, outbound_by_name, sections, [current], visited)
+    elif len(outbound_by_name[current]) == 0:
+      # we reached an output layer with no further layers
+      sections[current] = ChainSection(current, current_chain)
+      end = True
+    elif len(outbound_by_name[current]) == 1:
+      # a normal node in a chain, append 
+      current_chain.append(current)
+      if len(inbound_by_name[outbound_by_name[current][0]]) > 1:
+        # next node will be a concat node, so we create and finsish the chain
+        sections[current] = ChainSection(current, current_chain)
+        current_chain = []
+      current = outbound_by_name[current][0]
 
 # find layers without connections
 def find_inout(inoutbound_by_name):
@@ -540,15 +633,22 @@ dprint("Input layers:"+str(input_layers))
 dprint("Output layers:"+str(output_layers))
 
 # compute all our sections
-raw_sections = chain_layers(input_layers[0], inbound_by_name, outbound_by_name)
-#print(json.dumps(raw_sections ,sort_keys=False, indent=4))
+section_dict = {}
+chain_layers(input_layers[0], inbound_by_name, outbound_by_name, section_dict,[])
+dddprint(pretty(section_dict))
+
+raw_sections = []
+for section in section_dict.values():
+  raw_sections.append(section)
+
+dddprint(pretty(raw_sections))
 
 # returns a list of all sections that will have to be defined
 # as referenceable constants
 def defined_sections(sections):
   result = []
   for section in sections:
-    result.append(section[2])
+    result.append(section.name)
   return result 
 
 defined = defined_sections(raw_sections)
@@ -561,11 +661,11 @@ def referencing_sections(sections):
   result = {}
   for referencing_section in sections:
     referencing = []
-    for reference in referencing_section[3]:
-      if reference in defined and reference != referencing_section[2]:
+    for reference in referencing_section.layers:
+      if reference in defined and reference != referencing_section.name:
         referencing.append(reference)
-    result[referencing_section[2]] = referencing
-    dprint(referencing_section[2]+" is referencing "+str(referencing))
+    result[referencing_section.name] = referencing
+    ddprint(referencing_section.name+" is referencing "+str(referencing))
     #print("result ="+str(result))
   return result
 
@@ -583,7 +683,7 @@ def sort_sections(sections):
     if len(referencing[name]) == 0:
       order.append(name)
 
-  dprint("Sections not referencing any other section:="+str(order))
+  dprint("Sections not referencing any other section (should contain all inputs):"+str(order))
 
   # repeat iterating over all sections that reference others,
   # adding every section that has all its referecens already
@@ -610,11 +710,11 @@ def sort_sections(sections):
   assert len(order) == len(sections), "Could not resolve all references"
 
   # so far we only gather section names by order, now bring the sections
-  # in order
+  # themselves in suitable order
   result = []
   for name in order:
     for section in sections:
-      if section[2] == name:
+      if section.name == name:
         result.append(section)
 
   return result
@@ -623,9 +723,8 @@ referencing = referencing_sections(raw_sections)
 #print(json.dumps(referencing ,sort_keys=False, indent=4))
 
 sections = sort_sections(raw_sections)
-#sections = raw_sections
-dprint("SORTED::::::::::::::::::::")
-dprint(json.dumps(sections ,sort_keys=False, indent=4))
+dprint("Sections ordered properly by referencing:")
+dprint(pretty(sections))
 
 # stub for keras -> metal activation function translation
 def translated_activation(activation):
@@ -634,6 +733,64 @@ def translated_activation(activation):
   return translation[activation]
 
 #generate swift source for Forge network code
+
+# return the name of the activation layer even if the layer
+# may have been merged into another (e.g. Conv) layer
+def activation_layer(name):
+  if name in original_activation_layer_of:
+    return original_activation_layer_of[name]
+  else:
+    return name
+
+def to_swift(value):
+  if isinstance(value,bool):
+    return "true" if value else "false"
+  return str(value)
+
+def to_swift_enum(enum):
+  translation = { "same": ".same",
+                  "valid": ".valid"}
+  if enum in translation:
+    return translation[enum]
+  else:
+    raise RuntimeError("Can't convert keras enum:"+enum)
+
+def is_function(arg):
+  return callable(arg)
+
+# Base class for all the source generation classes
+class ForgeLayer():
+  def __init__(self, layer, forge_class, params):
+    self.layer = layer
+    self.cfg = layer.get_config()
+    self.name = layer.name
+    self.forge_class = forge_class
+    self.params = params
+  def swift_source(self):
+    dprint(str(self.params))
+    line = "let {} = {}(".format(self.name, self.forge_class)
+    i = 1
+    for swift_param in self.params:
+      origin = self.params[swift_param]
+      dprint("swift_param:'"+swift_param+"', origin:'"+str(origin)+"'")
+      cfg_name = origin[0] # name of the keras config item
+      # third argument is a precomputed value if first argument is ""
+      # or a conversion function if present
+      converter = to_swift if len(origin) < 3 or not is_function(origin[2]) else origin[2]
+      val = converter(self.cfg[cfg_name]) if cfg_name != "" else origin[2]
+      # do not emit code if actual value is default value
+      default_val = origin[1] if len(origin) > 1 else None
+      if not default_val or to_swift(default_val) != val:
+        arg = "{}: {}".format(swift_param, val)
+        line += arg 
+        if i < len(self.params):
+          line += ", "
+      i += 1
+    line += ")"
+    dprint(line)
+    return [line]    
+
+# Generate Forge class "Convolution":
 '''
 public init(kernel: (Int, Int),
     channels: Int,
@@ -643,14 +800,18 @@ public init(kernel: (Int, Int),
     useBias: Bool = true,
     name: String = "") {
 '''
-def conv2DSource(kernel, channels, stride, padding, activation, useBias, name):
-#Convolution(kernel: (3, 3), channels: 16, activation: leaky, name: "conv1")
-  line = 'let {} = Convolution(kernel: ({}, {}), channels: {}, stride: ({}, {}), padding: .{},'\
-         ' activation: {}, name: "{}")'.format(name, kernel[0], kernel[1], channels, stride[0],
-         stride[1], padding, activation, name)
-  print(line)
-  return line
-
+class ForgeConv2D(ForgeLayer):
+  def __init__(self, layer, var_name_of_activation):
+    params = { 
+      "kernel" : ("kernel_size",),
+      "channels" : ("filters",),
+      "stride" : ("strides", (1, 1)),
+      "padding" : ("padding", ".same", to_swift_enum),
+      "useBias" : ("use_bias", True),
+      "activation" : ("", "nil", 
+        var_name_of_activation[activation_of_layer[activation_layer(layer.name)]])
+    }
+    super().__init__(layer, "Convolution", params)
 
 '''
   kernel: (Int, Int),
@@ -666,11 +827,11 @@ def maxPoolSource(kernel, stride, padding, edgeMode, name):
          stride[1], padding, edgeMode, name)
   print(line)
   return line
-
-def conv2DsourceFromConfig(layer):
+'''
+def conv2DSourceFromConfig(layer):
   cfg = layer.get_config()
+  ddprint(pretty(cfg))
   
-  #print(json.dumps(config ,sort_keys=True, indent=4))
   activation = cfg["activation"]
   if layer_name(layer) in replaced_layers.values():
     activation = "leaky"
@@ -678,63 +839,120 @@ def conv2DsourceFromConfig(layer):
     activation = translated_activation(activation)
   return conv2DSource(cfg["kernel_size"], cfg["filters"], cfg["strides"], cfg["padding"],
                       activation, cfg["use_bias"], layer_name(layer))
-
-def maxPoolsourceFromConfig(layer):
+'''
+def maxPoolSourceFromConfig(layer):
   cfg = layer.get_config()
-  #print(json.dumps(config ,sort_keys=True, indent=4))
+  ddprint(pretty(cfg))
   return maxPoolSource(cfg["pool_size"], cfg["strides"], cfg["padding"],
                       ".clamp", layer_name(layer))
 
+# Forge supports only one input so far
+input_already_defined = False
+def inputSource(width, height, name):
+  if input_already_defined:
+    raise RuntimeError("Forge supports only one input but network has multiple inputs")
+  src = []
+  src.append("let input = Input()")
+  src.append("let {} = input --> Resize(width: {}, height: {})"\
+                  .format(name, width, height))
+  dprint(src)
+  input_defined = True
+  return src
+
+def inputSourceFromConfig(layer):
+  cfg = layer.get_config()
+  dprint(pretty(cfg))
+  return inputSource(cfg["batch_input_shape"][1], cfg["batch_input_shape"][2], layer_name(layer))
 
 swift_src = []
 swift_src.append("")
 swift_src.append("// begin of autogenerated forge net generation code")
 swift_src.append("")
 
-class_of_layer = {}
-swift_src.append("let leaky = MPSCNNNeuronReLU(device: device, a: 0.1)")
+# declare activation functions
+
+used_prefix_counter = {}
+var_name_of_activation = {}
+
+for activation in activations:
+  params = params_of_activation[activation]
+  
+  if 'swift_prefix' in params:
+    prefix = params['swift_prefix']
+
+    if prefix in used_prefix_counter.keys():
+      next_prefix = used_prefix_counter[prefix] + 1
+      prefix = prefix + "_" + str(used_prefix_counter[prefix])
+      used_prefix_counter[prefix] = next_prefix
+    else:
+      used_prefix_counter[prefix] = 2
+
+    var_name_of_activation[activation] = prefix
+    swift_src.append("let {} = {}".format(prefix, params['metal_func']))
+
+#swift_src.append("let leaky = MPSCNNNeuronReLU(device: device, a: 0.1)")
+'''
 for input_name in input_layers:
   swift_src.append("let input = Input()")
   swift_src.append("let {} = input --> Resize(width: {}, height: {})"\
                   .format(input_name, batch_input_shape[1], batch_input_shape[2]))
   swift_src.append("")
+'''
 
 for index, layer in enumerate(new_model.layers):
-  print(str(index)+":"+layer.__class__.__name__+" name:"+layer_name(layer))
-  class_of_layer[layer_name(layer)] = layer.__class__.__name__
-  #print("\n"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
-  #print("Layer name:"+layer_name(layer))
+  name = layer_name(layer)
+ 
+  dprint(str(index)+":"+layer.__class__.__name__+" name:"+name)
+  dprint(str(index)+"type::"+str(type(layer)))
+  
   inbound_layers = orig_input_layers(inbounds, new_model)
-  if layer.__class__.__name__ == "Conv2D":
-    swift_src.append(conv2DsourceFromConfig(layer))
-  elif layer.__class__.__name__ == "MaxPooling2D":
-    swift_src.append(maxPoolsourceFromConfig(layer))
-  elif layer.__class__.__name__ == "Lambda" and layer.name == "space_to_depth_x2":
-    swift_src.append('let {} = SpaceToDepthX2(name: "{}")'.format(layer.name, layer.name))
+
+  if layer_name(layer) in replaced_layers.keys():
+    dprint("Layer '"+name+"' has been replaced by activation in layer '"+replaced_layers[name])
+  else:
+    if type(layer) == Conv2D:
+      swift_src.extend(ForgeConv2D(layer, var_name_of_activation).swift_source())
+    elif type(layer) == keras.engine.topology.InputLayer:
+      swift_src.extend(inputSourceFromConfig(layer))
+    elif type(layer) == MaxPooling2D:
+      swift_src.append(maxPoolSourceFromConfig(layer))
+    elif type(layer) == AveragePooling2D:
+      swift_src.append(maxPoolSourceFromConfig(layer))
+    elif layer.__class__.__name__ == "Concatenate":
+      dprint("Concatenate layer '"+name+"' will not be predefined here")
+    elif type(layer) == Activation:
+      swift_src.append(activationSourceFromConfig(layer))
+    elif type(layer) == keras.layers.core.Lambda and layer.name == "space_to_depth_x2":
+      swift_src.append('let {} = SpaceToDepthX2(name: "{}")'.format(layer.name, layer.name))
+    else:
+      raise ValueError("Unknown layer type:"+str(type(layer))+"\nConfig:\n"+
+                       pretty(layer.get_config()))
+
 
 swift_src.append("")
 
 swift_src.append("do {")
 
 for section in sections:
-  if (section[0] == "CHAIN"):
-    var_name = section[2]
+  var_name = section.name
+  if isinstance(section, ChainSection):
     line = "let "+var_name + " = "
-    for index, layer_id in enumerate(section[3]):
+    for index, layer_id in enumerate(section.layers):
       line += layer_id
-      if index < len(section[3])-1:
+      if index < len(section.layers)-1:
         line += " --> "
     swift_src.append(line)
-  elif section[0] == "CONCAT":
-    var_name = section[1]
+  elif isinstance(section, ConcatSection):
     line = "let "+var_name + " = Concatenate(["
-    for index, layer_id in enumerate(section[3]):
+    for index, layer_id in enumerate(section.layers):
       line += layer_id
-      if index < len(section[3])-1:
+      if index < len(section.layers)-1:
         line += ", "
     line += "])"
     swift_src.append(line)
- 
+  else:
+    raise RuntimeError("Unknown section type")
+
 swift_src.append("let output = {}".format(output_layers[0]))
 swift_src.append("model = Model(input: input, output: output)")
 swift_src.append("}")
@@ -750,7 +968,7 @@ swift_src.append("// end of autogenerated forge net generation code")
 for line in swift_src:
   print(line)
 
-new_model.save("model_data/yolo_nobn.h5")
+new_model.save(file_name_plus(model_path, "_nobn"))
 
 if DO_STATIC_CONVERSION:
   
