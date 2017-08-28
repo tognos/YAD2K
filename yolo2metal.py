@@ -25,31 +25,34 @@ import os
 import numpy as np
 import keras
 from keras.models import Sequential, load_model
-from keras.layers import Conv2D, MaxPooling2D, Input, Activation
+from keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, Input, Activation
 from keras.layers.advanced_activations import LeakyReLU, ELU, ThresholdedReLU
 from keras.models import Model
 from keras import layers
 
 from keras.applications.inception_v3 import InceptionV3
-
+from collections import OrderedDict
 import copy
 
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
 
-#MODEL="YOLO"
-MODEL="TINY_YOLO"
+MODEL="YOLO"
+#MODEL="TINY_YOLO"
 #MODEL="INCEPTION_V3"
 
 if MODEL == "YOLO":
+  model_name = "yolo"
   model_path = "model_data/yolo.h5"
   model = load_model(model_path)
 
 if MODEL == "TINY_YOLO":
+  model_name = "tiny_yolo"
   model_path = "model_data/tiny-yolo-voc.h5"
   model = load_model(model_path)
 
 if MODEL=="INCEPTION_V3":
+  model_name = "inception_v3"
   model_path = "model_data/inception_v3.h5"
   model = InceptionV3(weights='imagenet')
   model.save(model_path)
@@ -333,75 +336,9 @@ for layer_name_, weights in weights_by_name.items():
 # batch norm layer into the conv layer before it, so that we don't have
 # to perform the batch normalization at inference time.
 #
-# All conv layers (except the last) have 3x3 kernel, stride 1, and "same"
-# padding. Note that these conv layers did not have a bias in the original 
-# model, but here they do get a bias (from the batch normalization).
-#
-# The last conv layer has a 1x1 kernel and identity activation.
-#
-# All max pool layers (except the last) have 2x2 kernel, stride 2, "valid" 
-# padding. The last max pool layer has stride 1 and "same" padding.
-#
-# We still need to add the LeakyReLU activation as a separate layer, but 
-# in Metal we can combine the LeakyReLU with the conv layer.
-
-DO_STATIC_CONVERSION=False
-
-if DO_STATIC_CONVERSION:
-  model_nobn = Sequential()
-  model_nobn.add(Conv2D(16, (3, 3), padding="same", input_shape=(416, 416, 3)))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(MaxPooling2D())
-  model_nobn.add(Conv2D(32, (3, 3), padding="same"))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(MaxPooling2D())
-  model_nobn.add(Conv2D(64, (3, 3), padding="same"))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(MaxPooling2D())
-  model_nobn.add(Conv2D(128, (3, 3), padding="same"))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(MaxPooling2D())
-  model_nobn.add(Conv2D(256, (3, 3), padding="same"))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(MaxPooling2D())
-  model_nobn.add(Conv2D(512, (3, 3), padding="same"))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(MaxPooling2D(strides=(1, 1), padding="same"))
-  model_nobn.add(Conv2D(1024, (3, 3), padding="same"))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(Conv2D(1024, (3, 3), padding="same"))
-  model_nobn.add(LeakyReLU(alpha=0.1))
-  model_nobn.add(Conv2D(125, (1, 1), padding="same", activation='linear'))
-
-  W_nobn = []
-  print("W_nobn shape:"+str(np.shape(W_nobn)))
-  W_nobn.extend(fold_batch_norm(model.layers[1], model.layers[2]))
-  print("W_nobn shape:"+str(np.shape(W_nobn)))
-  W_nobn.extend(fold_batch_norm(model.layers[5], model.layers[6]))
-  print("W_nobn shape:"+str(np.shape(W_nobn)))
-  W_nobn.extend(fold_batch_norm(model.layers[9], model.layers[10]))
-  W_nobn.extend(fold_batch_norm(model.layers[13], model.layers[14]))
-  W_nobn.extend(fold_batch_norm(model.layers[17], model.layers[18]))
-  W_nobn.extend(fold_batch_norm(model.layers[21], model.layers[22]))
-  W_nobn.extend(fold_batch_norm(model.layers[25], model.layers[26]))
-  W_nobn.extend(fold_batch_norm(model.layers[28], model.layers[29]))
-  W_nobn.extend(model.layers[31].get_weights())
-  print("W_nobn shape:"+str(np.shape(W_nobn)))
-  #print(str(W_nobn))
-  model_nobn.set_weights(W_nobn)
-
-  print("model_nobn")
-  model_nobn.summary()
-
-  for index, layer in enumerate(model_nobn.layers):
-    print("no_bn:"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
-    print("newnb:"+str(index)+":"+new_model.layers[index+1].__class__.__name__+":"+str(new_model.layers[index+1].get_config())+"\n")
-    print(str(np.shape(layer.get_weights())))
-    print(str(np.shape(new_model.layers[index+1].get_weights())))
-
 # Convert the weights and biases to Metal format.
 
-EXPORT_LAYERS = False
+EXPORT_LAYERS = True
 if EXPORT_LAYERS:
   for layer_name_, weights in weights_by_name.items():
     print("Exporting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
@@ -412,12 +349,12 @@ if EXPORT_LAYERS:
     W = new_model.get_weights()
     for i, w in enumerate(weights):
       if i % 2 == 0:
-        print("Weights shape:"+w.shape)
-        outpath = os.path.join(dst_path, "%s.weights.bin" % layer_name_)
+        dprint("Weights shape:"+str(w.shape))
+        outpath = os.path.join(dst_path, "{}-{}.weights.bin".format(model_name,layer_name_))
         w.transpose(3, 0, 1, 2).tofile(outpath)
       else:
-        print("Biases shape:"+w.shape)
-        outpath = os.path.join(dst_path, "%s.biases.bin" % layer_name_)
+        dprint("Biases shape:"+str(w.shape))
+        outpath = os.path.join(dst_path, "{}-{}.biases.bin".format(model_name,layer_name_))
         w.tofile(outpath)
 
 class_of_layer = {}
@@ -439,7 +376,7 @@ def gather_activations(model):
       activation_of_layer[layer_name(layer)] = activation
       if activation == "linear":
         params = {"metal_func": "nil",
-                  "swift_prefix": "none"}
+                  "swift_prefix": "nil"}
       elif activation == "relu":
         params = {"metal_func": "MPSCNNNeuronReLU(device: device, a: 0)",
                   "swift_prefix": "relu"}
@@ -481,16 +418,6 @@ def outbound_layers(inbound_layers_by_name):
 # and the correspondig Conv layers with activations that shall
 # be referenced in the metal model instead because in manny case there
 # is no need for separate activation in the metal model
-def replaced_leakyReLUs(inbound_by_name, model):
-  replacements = {}
-  for index, layer in enumerate(model.layers):
-    if layer.__class__.__name__ == "LeakyReLU":
-      inbound = inbound_by_name[layer_name(layer)][0]
-      inbound_layer = model.get_layer(inbound)
-      if inbound_layer.__class__.__name__ == "Conv2D":
-        replacements[layer_name(layer)] = layer_name(inbound_layer)
-  return replacements
-
 def replaced_activation_layers(inbound_by_name, model):
   replacements = {}
   for index, layer in enumerate(model.layers):
@@ -601,12 +528,14 @@ def chain_layers(start_name, inbound_by_name, outbound_by_name, sections, curren
         chain_layers(output, inbound_by_name, outbound_by_name, sections, [current], visited)
     elif len(outbound_by_name[current]) > 1:
       # section is referenced by more than one layer, so the chain also ends
+      current_chain.append(current)
       sections[current] = ChainSection(current, current_chain)
       end = True
       for output in outbound_by_name[current]:
         chain_layers(output, inbound_by_name, outbound_by_name, sections, [current], visited)
     elif len(outbound_by_name[current]) == 0:
       # we reached an output layer with no further layers
+      current_chain.append(current)
       sections[current] = ChainSection(current, current_chain)
       end = True
     elif len(outbound_by_name[current]) == 1:
@@ -755,6 +684,9 @@ def to_swift_enum(enum):
   else:
     raise RuntimeError("Can't convert keras enum:"+enum)
 
+def quote_string(name):
+  return '"{}"'.format(name)
+
 def is_function(arg):
   return callable(arg)
 
@@ -782,69 +714,64 @@ class ForgeLayer():
       default_val = origin[1] if len(origin) > 1 else None
       if not default_val or to_swift(default_val) != val:
         arg = "{}: {}".format(swift_param, val)
-        line += arg 
-        if i < len(self.params):
+        if i > 1:
           line += ", "
-      i += 1
+        line += arg 
+        i += 1
     line += ")"
     dprint(line)
     return [line]    
 
 # Generate Forge class "Convolution":
-'''
-public init(kernel: (Int, Int),
-    channels: Int,
-    stride: (Int, Int) = (1, 1),
-    padding: PaddingType = .same,
-    activation: MPSCNNNeuron? = nil,
-    useBias: Bool = true,
-    name: String = "") {
-'''
+#
+# init(kernel: (Int, Int),
+#    channels: Int,
+#    stride: (Int, Int) = (1, 1),
+#    padding: PaddingType = .same,
+#    activation: MPSCNNNeuron? = nil,
+#    useBias: Bool = true,
+#    name: String = "")
+#
 class ForgeConv2D(ForgeLayer):
   def __init__(self, layer, var_name_of_activation):
-    params = { 
-      "kernel" : ("kernel_size",),
-      "channels" : ("filters",),
-      "stride" : ("strides", (1, 1)),
-      "padding" : ("padding", ".same", to_swift_enum),
-      "useBias" : ("use_bias", True),
-      "activation" : ("", "nil", 
-        var_name_of_activation[activation_of_layer[activation_layer(layer.name)]])
-    }
+    params = OrderedDict([ 
+      ("kernel"    , ("kernel_size",)),
+      ("channels"  , ("filters",)),
+      ("stride"    , ("strides", (1, 1))),
+      ("padding"   , ("padding", ".same", to_swift_enum)),
+      ("useBias"   , ("use_bias", True)),
+      ("activation", ("", "nil", 
+        var_name_of_activation[activation_of_layer[activation_layer(layer.name)]])),
+      ("name"    , ("name","",quote_string))
+    ])
     super().__init__(layer, "Convolution", params)
 
-'''
-  kernel: (Int, Int),
-  stride: (Int, Int),
-  padding: PaddingType = .valid,
-  edgeMode: MPSImageEdgeMode = .clamp,
-  name: String = ""
-'''
-def maxPoolSource(kernel, stride, padding, edgeMode, name):
-#Convolution(kernel: (3, 3), channels: 16, activation: leaky, name: "conv1")
-  line = 'let {} = MaxPooling(kernel: ({}, {}), stride: ({}, {}), padding: .{},'\
-         'edgeMode: {}, name: "{}")'.format(name, kernel[0], kernel[1], stride[0],
-         stride[1], padding, edgeMode, name)
-  print(line)
-  return line
-'''
-def conv2DSourceFromConfig(layer):
-  cfg = layer.get_config()
-  ddprint(pretty(cfg))
-  
-  activation = cfg["activation"]
-  if layer_name(layer) in replaced_layers.values():
-    activation = "leaky"
-  else:
-    activation = translated_activation(activation)
-  return conv2DSource(cfg["kernel_size"], cfg["filters"], cfg["strides"], cfg["padding"],
-                      activation, cfg["use_bias"], layer_name(layer))
-'''
-def maxPoolSourceFromConfig(layer):
-  cfg = layer.get_config()
-  ddprint(pretty(cfg))
-  return maxPoolSource(cfg["pool_size"], cfg["strides"], cfg["padding"],
-                      ".clamp", layer_name(layer))
+# Generate Forge class "MaxPooling":
+#
+# init( kernel: (Int, Int),
+#  stride: (Int, Int),
+#  padding: PaddingType = .valid,
+#  edgeMode: MPSImageEdgeMode = .clamp,
+#  name: String = "")
+#
+class ForgePooling(ForgeLayer):
+  def __init__(self, layer, forge_class):
+    params = OrderedDict([ 
+      ("kernel"  , ("pool_size",)),
+      ("stride"  , ("strides",)),
+      ("padding" , ("padding", ".valid", to_swift_enum)),
+      ("edgeMode", ("", ".clamp", ".clamp")),
+      ("name"    , ("name","",quote_string))
+    ])
+    super().__init__(layer, forge_class, params)
+
+class ForgeMaxPooling2D(ForgePooling):
+  def __init__(self, layer):
+    super().__init__(layer, "MaxPooling")
+
+class ForgeAveragePooling2D(ForgePooling):
+  def __init__(self, layer):
+    super().__init__(layer, "AveragePooling")
 
 # Forge supports only one input so far
 input_already_defined = False
@@ -864,9 +791,13 @@ def inputSourceFromConfig(layer):
   dprint(pretty(cfg))
   return inputSource(cfg["batch_input_shape"][1], cfg["batch_input_shape"][2], layer_name(layer))
 
+# start swift source generation
+
 swift_src = []
 swift_src.append("")
 swift_src.append("// begin of autogenerated forge net generation code")
+swift_src.append("")
+swift_src.append("var model:Model")
 swift_src.append("")
 
 # declare activation functions
@@ -877,7 +808,7 @@ var_name_of_activation = {}
 for activation in activations:
   params = params_of_activation[activation]
   
-  if 'swift_prefix' in params:
+  if 'swift_prefix' in params and params['swift_prefix']:
     prefix = params['swift_prefix']
 
     if prefix in used_prefix_counter.keys():
@@ -888,16 +819,8 @@ for activation in activations:
       used_prefix_counter[prefix] = 2
 
     var_name_of_activation[activation] = prefix
-    swift_src.append("let {} = {}".format(prefix, params['metal_func']))
-
-#swift_src.append("let leaky = MPSCNNNeuronReLU(device: device, a: 0.1)")
-'''
-for input_name in input_layers:
-  swift_src.append("let input = Input()")
-  swift_src.append("let {} = input --> Resize(width: {}, height: {})"\
-                  .format(input_name, batch_input_shape[1], batch_input_shape[2]))
-  swift_src.append("")
-'''
+    if prefix != "nil":
+      swift_src.append("let {} = {}".format(prefix, params['metal_func']))
 
 for index, layer in enumerate(new_model.layers):
   name = layer_name(layer)
@@ -915,9 +838,9 @@ for index, layer in enumerate(new_model.layers):
     elif type(layer) == keras.engine.topology.InputLayer:
       swift_src.extend(inputSourceFromConfig(layer))
     elif type(layer) == MaxPooling2D:
-      swift_src.append(maxPoolSourceFromConfig(layer))
+      swift_src.extend(ForgeMaxPooling2D(layer).swift_source())
     elif type(layer) == AveragePooling2D:
-      swift_src.append(maxPoolSourceFromConfig(layer))
+      swift_src.extend(ForgeAveragePooling2D(layer).swift_source())
     elif layer.__class__.__name__ == "Concatenate":
       dprint("Concatenate layer '"+name+"' will not be predefined here")
     elif type(layer) == Activation:
@@ -937,8 +860,12 @@ for section in sections:
   var_name = section.name
   if isinstance(section, ChainSection):
     line = "let "+var_name + " = "
+    char_offset = len(line)
     for index, layer_id in enumerate(section.layers):
       line += layer_id
+      if len(line)-char_offset > 70:
+        line +="\n        "
+        char_offset += len(line)
       if index < len(section.layers)-1:
         line += " --> "
     swift_src.append(line)
@@ -959,6 +886,7 @@ swift_src.append("}")
 swift_src.append("let success = model.compile(device: device, inflightBuffers: inflightBuffers) { ")
 swift_src.append("  name, count, type in ParameterLoaderBundle(name: name,")
 swift_src.append("  count: count,")
+swift_src.append('  prefix: "{}-",'.format(model_name))
 swift_src.append('  suffix: type == .weights ? ".weights" : ".biases",')
 swift_src.append('  ext: "bin")')
 swift_src.append("}")
@@ -970,6 +898,7 @@ for line in swift_src:
 
 new_model.save(file_name_plus(model_path, "_nobn"))
 
+'''
 if DO_STATIC_CONVERSION:
   
   print("\nConverting parameters...")
@@ -983,7 +912,7 @@ if DO_STATIC_CONVERSION:
       w.transpose(3, 0, 1, 2).tofile(os.path.join(dst_path, "conv%d_W.bin" % j))
     else:
       w.tofile(os.path.join(dst_path, "conv%d_b.bin" % j))
-
+'''
 
 # Make a prediction using the original model and also using the model that
 # has batch normalization removed, and check that the differences between
@@ -999,8 +928,8 @@ test_shape = (1, batch_input_shape[1], batch_input_shape[2],batch_input_shape[3]
 image_data = np.random.random(test_shape).astype('float32')
 
 features = model.predict(image_data)
-if DO_STATIC_CONVERSION:
-  features_nobn = model_nobn.predict(image_data)
+#if DO_STATIC_CONVERSION:
+#  features_nobn = model_nobn.predict(image_data)
 features_auto = new_model.predict(image_data)
 
 def compare_features(features1, features2):
@@ -1014,8 +943,8 @@ def compare_features(features1, features2):
           print(i, j, k, ":", features1[0, i, j, k], features2[0, i, j, k], diff)
   print("Largest error:", max_error)
 
-if DO_STATIC_CONVERSION:
-  compare_features(features, features_nobn)
+#if DO_STATIC_CONVERSION:
+#  compare_features(features, features_nobn)
 compare_features(features, features_auto)
 
 
