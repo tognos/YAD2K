@@ -25,7 +25,7 @@ import os
 import numpy as np
 import keras
 from keras.models import Sequential, load_model
-from keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, Input, Activation
+from keras.layers import Dense, Conv2D, MaxPooling2D, GlobalAveragePooling2D, AveragePooling2D, Input, Activation
 from keras.layers.advanced_activations import LeakyReLU, ELU, ThresholdedReLU
 from keras.models import Model
 from keras import layers
@@ -37,9 +37,9 @@ import copy
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
 
-MODEL="YOLO"
 #MODEL="TINY_YOLO"
-#MODEL="INCEPTION_V3"
+#MODEL="YOLO"
+MODEL="INCEPTION_V3"
 
 if MODEL == "YOLO":
   model_name = "yolo"
@@ -338,25 +338,47 @@ for layer_name_, weights in weights_by_name.items():
 #
 # Convert the weights and biases to Metal format.
 
-EXPORT_LAYERS = True
-if EXPORT_LAYERS:
+def export_layers(model, model_name, dst_path="Parameters"):
+  for layer in model.layers:
+    weights = layer.get_weights()
+    if weights and len(weights):
+      dprint("Exporting weights for layer "+layer.name+" type " + str(type(layer)))
+    for i, w in enumerate(weights):
+      if i % 2 == 0:
+        dprint("Weights shape:"+str(w.shape))
+        outpath = os.path.join(dst_path, "{}-{}.weights.bin".format(model_name,layer.name))
+        if type(layer) == Conv2D:
+          w.transpose(3, 0, 1, 2).tofile(outpath)
+        else:
+          w.tofile(outpath)
+      else:
+        dprint("Biases shape:"+str(w.shape))
+        outpath = os.path.join(dst_path, "{}-{}.biases.bin".format(model_name,layer.name))
+        w.tofile(outpath)
+
+export_layers(new_model, model_name)
+
+'''
+def export_layers(model, dst_path="Parameters"):
+  W = new_model.get_weights()
   for layer_name_, weights in weights_by_name.items():
     print("Exporting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
     #print("weights     :"+str(np.shape(weights)))
     #print("orig_weights:"+str(np.shape(layer_by_name[layer_name_].get_weights())))
-
-    dst_path = "Parameters"
-    W = new_model.get_weights()
-    for i, w in enumerate(weights):
-      if i % 2 == 0:
-        dprint("Weights shape:"+str(w.shape))
-        outpath = os.path.join(dst_path, "{}-{}.weights.bin".format(model_name,layer_name_))
-        w.transpose(3, 0, 1, 2).tofile(outpath)
-      else:
-        dprint("Biases shape:"+str(w.shape))
-        outpath = os.path.join(dst_path, "{}-{}.biases.bin".format(model_name,layer_name_))
-        w.tofile(outpath)
-
+    layer = layer_by_name[layer_name_]
+      for i, w in enumerate(weights):
+        if i % 2 == 0:
+          dprint("Weights shape:"+str(w.shape))
+          outpath = os.path.join(dst_path, "{}-{}.weights.bin".format(model_name,layer_name_))
+          if type(layer) == Conv2D:
+            w.transpose(3, 0, 1, 2).tofile(outpath)
+          else:
+            w.tofile(outpath)
+        else:
+          dprint("Biases shape:"+str(w.shape))
+          outpath = os.path.join(dst_path, "{}-{}.biases.bin".format(model_name,layer_name_))
+          w.tofile(outpath)
+'''      
 class_of_layer = {}
 
 for layer in new_model.layers:
@@ -773,6 +795,29 @@ class ForgeAveragePooling2D(ForgePooling):
   def __init__(self, layer):
     super().__init__(layer, "AveragePooling")
 
+class ForgeGlobalAveragePooling2D(ForgeLayer):
+  def __init__(self, layer):
+    params = OrderedDict([ 
+      ("name"    , ("name","",quote_string)),
+      ("useBias"   , ("", True, "false"))
+    ])
+    super().__init__(layer, "GlobalAveragePooling", params)
+
+# Generate Forge class "Dense":
+#
+# init(neurons: Int,
+#   activation: MPSCNNNeuron? = nil,
+#   useBias: Bool = true,
+#   name: String = "")
+class ForgeDense(ForgeLayer):
+  def __init__(self, layer):
+    params = OrderedDict([ 
+      ("neurons" , ("units",)),
+      ("useBias" , ("use_bias", True)),
+      ("name"    , ("name","",quote_string))
+    ])
+    super().__init__(layer, "Dense", params)
+
 # Forge supports only one input so far
 input_already_defined = False
 def inputSource(width, height, name):
@@ -780,7 +825,13 @@ def inputSource(width, height, name):
     raise RuntimeError("Forge supports only one input but network has multiple inputs")
   src = []
   src.append("let input = Input()")
-  src.append("let {} = input --> Resize(width: {}, height: {})"\
+  # inception V3 wants input scaled between -1 and 1, but we can not
+  # know that from the model; there is nothing about that in the input config
+  if MODEL == "INCEPTION_V3":
+    src.append("let {} = input --> Resize(width: {}, height: {}) --> Activation(input_scale)"\
+                  .format(name, width, height))
+  else:
+    src.append("let {} = input --> Resize(width: {}, height: {})"\
                   .format(name, width, height))
   dprint(src)
   input_defined = True
@@ -822,6 +873,11 @@ for activation in activations:
     if prefix != "nil":
       swift_src.append("let {} = {}".format(prefix, params['metal_func']))
 
+# inception V3 wants input scaled between -1 and 1, but we can not
+# know that from the model; there is nothing about that in the input config
+if MODEL == "INCEPTION_V3":
+  swift_src.append("let input_scale = MPSCNNNeuronLinear(device: device, a: 2, b: -1)")
+
 for index, layer in enumerate(new_model.layers):
   name = layer_name(layer)
  
@@ -841,6 +897,10 @@ for index, layer in enumerate(new_model.layers):
       swift_src.extend(ForgeMaxPooling2D(layer).swift_source())
     elif type(layer) == AveragePooling2D:
       swift_src.extend(ForgeAveragePooling2D(layer).swift_source())
+    elif type(layer) == GlobalAveragePooling2D:
+      swift_src.extend(ForgeGlobalAveragePooling2D(layer).swift_source())
+    elif type(layer) == Dense:
+      swift_src.extend(ForgeDense(layer).swift_source())
     elif layer.__class__.__name__ == "Concatenate":
       dprint("Concatenate layer '"+name+"' will not be predefined here")
     elif type(layer) == Activation:
@@ -880,7 +940,12 @@ for section in sections:
   else:
     raise RuntimeError("Unknown section type")
 
-swift_src.append("let output = {}".format(output_layers[0]))
+# This is a bit hacky, we should always insert a Softmax layer after a
+# Dense keras layer with softmax activatio (not just for this model)
+if MODEL == "INCEPTION_V3":
+  swift_src.append("let output = {} --> Softmax()".format(output_layers[0]))
+else:
+  swift_src.append("let output = {}".format(output_layers[0]))
 swift_src.append("model = Model(input: input, output: output)")
 swift_src.append("}")
 swift_src.append("let success = model.compile(device: device, inflightBuffers: inflightBuffers) { ")
