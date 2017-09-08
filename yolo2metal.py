@@ -25,21 +25,38 @@ import os
 import numpy as np
 import keras
 from keras.models import Sequential, load_model
-from keras.layers import Dense, Conv2D, MaxPooling2D, GlobalAveragePooling2D, AveragePooling2D, Input, Activation
+
+from keras.layers import Dense, Conv2D, ZeroPadding2D, Input, Activation
+from keras.layers import MaxPooling2D, GlobalAveragePooling2D, AveragePooling2D
+from keras.layers import Add, Multiply, Average, Maximum
+from keras.layers import Flatten
+
 from keras.layers.advanced_activations import LeakyReLU, ELU, ThresholdedReLU
 from keras.models import Model
 from keras import layers
-
-from keras.applications.inception_v3 import InceptionV3
+from keras.preprocessing import image
+from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
 from collections import OrderedDict
 import copy
+from PIL import Image
+import imghdr
+
+from keras.applications.resnet50 import ResNet50
+from keras.preprocessing import image
+from keras.applications.resnet50 import preprocess_input, decode_predictions
 
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
+RUN_CLASSIFIER = False
+PLOT_MODELS = False
+SAVE_ORIGINAL_MODEL = False
 
 #MODEL="TINY_YOLO"
 #MODEL="YOLO"
-MODEL="INCEPTION_V3"
+#as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
+#and gives meaningless predictions
+#MODEL="INCEPTION_V3"
+MODEL="RESNET_50"
 
 if MODEL == "YOLO":
   model_name = "yolo"
@@ -55,7 +72,15 @@ if MODEL=="INCEPTION_V3":
   model_name = "inception_v3"
   model_path = "model_data/inception_v3.h5"
   model = InceptionV3(weights='imagenet')
-  model.save(model_path)
+  if SAVE_ORIGINAL_MODEL:
+    model.save(model_path)
+
+if MODEL=="RESNET_50":
+  model_name = "resnet_50"
+  model_path = "model_data/resnet50.h5"
+  model = ResNet50(weights='imagenet')
+  if SAVE_ORIGINAL_MODEL:
+    model.save(model_path)
 
 def file_name_plus(path_name, name_extension):
   path_file, extension = os.path.splitext(path_name)
@@ -66,8 +91,10 @@ def changed_extension(path_name, new_extension):
   return path_file + new_extension
 
 model.summary()
-from keras.utils import plot_model
-plot_model(model, to_file=changed_extension(model_path,'.png'))
+
+if PLOT_MODELS:
+  from keras.utils import plot_model
+  plot_model(model, to_file=changed_extension(model_path,'.png'))
 
 def dprint(*args, **kwargs):
   if DEBUG_OUT:
@@ -80,6 +107,46 @@ def ddprint(*args, **kwargs):
 def dddprint(*args, **kwargs):
   if False:
     print(*args, **kwargs)
+
+
+#############
+
+def predict_image(model, img_path):
+  batch_input_shape = model.layers[0].get_config()['batch_input_shape']
+  input_shape = batch_input_shape[1:3]
+
+  dprint("Loading "+img_path)
+  img = image.load_img(img_path, target_size=input_shape)
+  x = image.img_to_array(img)
+  x = np.expand_dims(x, axis=0)
+  x = preprocess_input(x)
+  ddprint(str(x.shape))
+  x = preprocess_input(x)
+
+  preds = model.predict(x)
+
+  # decode the results into a list of tuples (class, description, probability)
+  # (one such list for each sample in the batch)
+  dprint('Predicted:', decode_predictions(preds, top=3)[0])
+  return preds
+
+def predict_in_dir(models, image_dir):
+  for image_file in os.listdir(image_dir): 
+    try: 
+      image_type = imghdr.what(os.path.join(image_dir, image_file)) 
+      if not image_type: 
+        continue 
+    except IsADirectoryError: 
+      continue 
+    for model in models:
+      predict_image(model, os.path.join(image_dir, image_file))
+
+if MODEL == "INCEPTION_V3" or MODEL=="RESNET_50":
+  #compare_features_fast(features, features_auto)
+  if RUN_CLASSIFIER:
+    predict_in_dir([model], "images/classify")
+
+############
 
 
 import json
@@ -317,7 +384,8 @@ for index, layer in enumerate(model.layers):
 # create our new model using the keras functional API
 new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
 new_model.summary()
-plot_model(new_model, to_file=changed_extension(file_name_plus(model_path,'_new'),'.png'))
+if PLOT_MODELS:
+  plot_model(new_model, to_file=changed_extension(file_name_plus(model_path,'_new'),'.png'))
 
 ddprint("Replaced layers:"+str(replaced_layer))
 
@@ -358,32 +426,12 @@ def export_layers(model, model_name, dst_path="Parameters"):
 
 export_layers(new_model, model_name)
 
-'''
-def export_layers(model, dst_path="Parameters"):
-  W = new_model.get_weights()
-  for layer_name_, weights in weights_by_name.items():
-    print("Exporting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
-    #print("weights     :"+str(np.shape(weights)))
-    #print("orig_weights:"+str(np.shape(layer_by_name[layer_name_].get_weights())))
-    layer = layer_by_name[layer_name_]
-      for i, w in enumerate(weights):
-        if i % 2 == 0:
-          dprint("Weights shape:"+str(w.shape))
-          outpath = os.path.join(dst_path, "{}-{}.weights.bin".format(model_name,layer_name_))
-          if type(layer) == Conv2D:
-            w.transpose(3, 0, 1, 2).tofile(outpath)
-          else:
-            w.tofile(outpath)
-        else:
-          dprint("Biases shape:"+str(w.shape))
-          outpath = os.path.join(dst_path, "{}-{}.biases.bin".format(model_name,layer_name_))
-          w.tofile(outpath)
-'''      
 class_of_layer = {}
+layer_with_name = {}
 
 for layer in new_model.layers:
-  class_of_layer[layer_name(layer)] = layer.__class__.__name__
-
+  class_of_layer[layer.name] = layer.__class__.__name__
+  layer_with_name[layer.name] = layer
 
 # returns a set of activations
 def gather_activations(model):
@@ -445,10 +493,13 @@ def replaced_activation_layers(inbound_by_name, model):
   for index, layer in enumerate(model.layers):
     if type(layer) in [LeakyReLU, ELU, Activation] and\
       'swift_prefix' in params_of_activation[activation_of_layer[layer.name]]:
-      inbound = inbound_by_name[layer_name(layer)][0]
+      inbound = inbound_by_name[layer.name][0]
       inbound_layer = model.get_layer(inbound)
       if type(inbound_layer) == Conv2D:
-        replacements[layer_name(layer)] = layer_name(inbound_layer)
+        replacements[layer.name] = inbound_layer.name
+    #if type(layer) in [Flatten]:
+    #  replacements[layer.name] = inbound_layer.name
+
   return replacements
 
 
@@ -492,6 +543,7 @@ dprint()
 
 # filters 
 #
+'''
 def filter_duplicates(existing, new):
   result = []
   for section in new:
@@ -502,6 +554,7 @@ def filter_duplicates(existing, new):
     if not exists:
       result.append(section)
   return result
+'''
 
 class ChainSection(dict):
   def __init__(self, name, layers):
@@ -735,7 +788,10 @@ class ForgeLayer():
       # do not emit code if actual value is default value
       default_val = origin[1] if len(origin) > 1 else None
       if not default_val or to_swift(default_val) != val:
-        arg = "{}: {}".format(swift_param, val)
+        if not swift_param[0]=='_':
+          arg = "{}: {}".format(swift_param, val)
+        else:
+          arg = val
         if i > 1:
           line += ", "
         line += arg 
@@ -744,7 +800,7 @@ class ForgeLayer():
     dprint(line)
     return [line]    
 
-# Generate Forge class "Convolution":
+# Generate Forge layer "Convolution":
 #
 # init(kernel: (Int, Int),
 #    channels: Int,
@@ -767,6 +823,18 @@ class ForgeConv2D(ForgeLayer):
       ("name"    , ("name","",quote_string))
     ])
     super().__init__(layer, "Convolution", params)
+
+# Generate Forge layer "Activation"
+#init(_ activation: MPSCNNNeuron, name: String = "")
+class ForgeActivation(ForgeLayer):
+  def __init__(self, layer, var_name_of_activation):
+    params = OrderedDict([ 
+      ("_activation", ("", "", 
+        var_name_of_activation[activation_of_layer[activation_layer(layer.name)]])),
+      ("name"    , ("name","",quote_string))
+    ])
+    super().__init__(layer, "Activation", params)
+
 
 # Generate Forge class "MaxPooling":
 #
@@ -802,6 +870,17 @@ class ForgeGlobalAveragePooling2D(ForgeLayer):
       ("useBias"   , ("", True, "false"))
     ])
     super().__init__(layer, "GlobalAveragePooling", params)
+
+def padding_list(padding):
+  return str((padding[0][0],padding[0][1],padding[1][0],padding[1][1]))
+
+class ForgeZeroPadding2D(ForgeLayer):
+  def __init__(self, layer):
+    params = OrderedDict([ 
+      ("tblr_padding", ("padding", None, padding_list)),
+      ("name"        , ("name","",quote_string))
+    ])
+    super().__init__(layer, "ZeroPadding", params)
 
 # Generate Forge class "Dense":
 #
@@ -848,8 +927,9 @@ swift_src = []
 swift_src.append("")
 swift_src.append("// begin of autogenerated forge net generation code")
 swift_src.append("")
-swift_src.append("var model:Model")
-swift_src.append("")
+#swift_src.append("var model:Model")
+#swift_src.append("")
+
 
 # declare activation functions
 
@@ -879,14 +959,14 @@ if MODEL == "INCEPTION_V3":
   swift_src.append("let input_scale = MPSCNNNeuronLinear(device: device, a: 2, b: -1)")
 
 for index, layer in enumerate(new_model.layers):
-  name = layer_name(layer)
+  name = layer.name
  
   dprint(str(index)+":"+layer.__class__.__name__+" name:"+name)
   dprint(str(index)+"type::"+str(type(layer)))
   
   inbound_layers = orig_input_layers(inbounds, new_model)
 
-  if layer_name(layer) in replaced_layers.keys():
+  if layer.name in replaced_layers.keys():
     dprint("Layer '"+name+"' has been replaced by activation in layer '"+replaced_layers[name])
   else:
     if type(layer) == Conv2D:
@@ -897,14 +977,18 @@ for index, layer in enumerate(new_model.layers):
       swift_src.extend(ForgeMaxPooling2D(layer).swift_source())
     elif type(layer) == AveragePooling2D:
       swift_src.extend(ForgeAveragePooling2D(layer).swift_source())
+    elif type(layer) == ZeroPadding2D:
+      swift_src.extend(ForgeZeroPadding2D(layer).swift_source())
     elif type(layer) == GlobalAveragePooling2D:
       swift_src.extend(ForgeGlobalAveragePooling2D(layer).swift_source())
     elif type(layer) == Dense:
       swift_src.extend(ForgeDense(layer).swift_source())
+    elif type(layer) in [Add, Multiply, Average, Maximum, Flatten]:
+      dprint(str(type(layer))+" layer '"+name+"' will not be predefined here")
     elif layer.__class__.__name__ == "Concatenate":
       dprint("Concatenate layer '"+name+"' will not be predefined here")
     elif type(layer) == Activation:
-      swift_src.append(activationSourceFromConfig(layer))
+      swift_src.extend(ForgeActivation(layer, var_name_of_activation).swift_source())
     elif type(layer) == keras.layers.core.Lambda and layer.name == "space_to_depth_x2":
       swift_src.append('let {} = SpaceToDepthX2(name: "{}")'.format(layer.name, layer.name))
     else:
@@ -916,33 +1000,46 @@ swift_src.append("")
 
 swift_src.append("do {")
 
+ignore_layer_types = ["Flatten"]
+
 for section in sections:
   var_name = section.name
   if isinstance(section, ChainSection):
     line = "let "+var_name + " = "
     char_offset = len(line)
     for index, layer_id in enumerate(section.layers):
-      line += layer_id
-      if len(line)-char_offset > 70:
-        line +="\n        "
-        char_offset += len(line)
-      if index < len(section.layers)-1:
-        line += " --> "
+      if class_of_layer[layer_id] not in ignore_layer_types:
+        line += layer_id
+        if len(line)-char_offset > 70:
+          line +="\n        "
+          char_offset += len(line)
+        if index < len(section.layers)-1:
+          line += " --> "
     swift_src.append(line)
   elif isinstance(section, ConcatSection):
-    line = "let "+var_name + " = Concatenate(["
+    layer = layer_with_name[section.name]
+    layer_class = class_of_layer[layer.name]
+    merge_function = "Concatenate" if layer_class == "Concat" else "Collect"
+    line = "let "+var_name + " = {}([".format(merge_function)
     for index, layer_id in enumerate(section.layers):
       line += layer_id
       if index < len(section.layers)-1:
         line += ", "
-    line += "])"
+    if merge_function != "Concatenate":
+      # Forge merge layers have the same class name as keras layers
+      line += '], name: "for_{}")'.format(layer.name)
+      line += ' --> {}(name: "{}")'.format(layer_class,layer.name)
+    else:
+      line += '], name: "{}")'.format(layer.name)
+
     swift_src.append(line)
   else:
     raise RuntimeError("Unknown section type")
 
-# This is a bit hacky, we should always insert a Softmax layer after a
-# Dense keras layer with softmax activatio (not just for this model)
-if MODEL == "INCEPTION_V3":
+# insert a softmax when the last layer is a ense keras layer with softmax activation
+last_layer = model.layers[-1]
+#print(pretty(last_layer.get_config()))
+if type(last_layer) == Dense and last_layer.get_config()["activation"] == "softmax":
   swift_src.append("let output = {} --> Softmax()".format(output_layers[0]))
 else:
   swift_src.append("let output = {}".format(output_layers[0]))
@@ -963,22 +1060,6 @@ for line in swift_src:
 
 new_model.save(file_name_plus(model_path, "_nobn"))
 
-'''
-if DO_STATIC_CONVERSION:
-  
-  print("\nConverting parameters...")
-
-  dst_path = "Parameters"
-  W = new_model.get_weights()
-  for i, w in enumerate(W):
-    j = i // 2 + 1
-    print(w.shape)
-    if i % 2 == 0:
-      w.transpose(3, 0, 1, 2).tofile(os.path.join(dst_path, "conv%d_W.bin" % j))
-    else:
-      w.tofile(os.path.join(dst_path, "conv%d_b.bin" % j))
-'''
-
 # Make a prediction using the original model and also using the model that
 # has batch normalization removed, and check that the differences between
 # the two predictions are small enough. They seem to be smaller than 1e-4,
@@ -986,18 +1067,32 @@ if DO_STATIC_CONVERSION:
 
 print("Comparing models...")
 
-
 #image_data = np.random.random((1, 416, 416, 3)).astype('float32')
 #image_data = np.random.random((1, 608, 608, 3)).astype('float32')
 test_shape = (1, batch_input_shape[1], batch_input_shape[2],batch_input_shape[3])
 image_data = np.random.random(test_shape).astype('float32')
 
 features = model.predict(image_data)
-#if DO_STATIC_CONVERSION:
-#  features_nobn = model_nobn.predict(image_data)
 features_auto = new_model.predict(image_data)
 
-def compare_features(features1, features2):
+print("features.shape:"+str(features.shape))
+print("features_auto.shape:"+str(features_auto.shape))
+
+def compare_features_fast(features1, features2):
+  error = np.abs(features1 - features2)
+  max_error = np.max(error)
+  avrg_error = np.sum(error)/features1.size
+  min_1 = np.min(features1)
+  min_2 = np.min(features2)
+  max_1 = np.max(features1)
+  max_2 = np.max(features2)
+  avrg_1 = np.sum(features1)/features1.size
+  avrg_2 = np.sum(features2)/features2.size
+  print("error max:",max_error,"avrg:",avrg_error)
+  print("avrg1:",avrg_1,"min1:",min_1,"max1:", max_1)
+  print("avrg2:",avrg_2,"min2:",min_2,"max2:",max_2)
+
+def compare_features_yolo(features1, features2):
   max_error = 0
   for i in range(features1.shape[1]):
     for j in range(features1.shape[2]):
@@ -1008,9 +1103,12 @@ def compare_features(features1, features2):
           print(i, j, k, ":", features1[0, i, j, k], features2[0, i, j, k], diff)
   print("Largest error:", max_error)
 
-#if DO_STATIC_CONVERSION:
-#  compare_features(features, features_nobn)
-compare_features(features, features_auto)
+if MODEL == "INCEPTION_V3" or MODEL=="RESNET_50":
+  compare_features_fast(features, features_auto)
+  if RUN_CLASSIFIER:
+    predict_in_dir([model, new_model], "images/classify")
+else:
+  compare_features_yolo(features, features_auto)
 
 
 print("Done!")
