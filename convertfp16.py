@@ -2,8 +2,10 @@ import h5py
 import numpy as np
 import json
 
-filename = 'model_data/yolo_nobn.h5'
-outname = 'model_data/yolo_nobn.fp16.h5'
+#filename = 'model_data/yolo_nobn.h5'
+#outname = 'model_data/yolo_nobn.fp16.h5'
+filename = 'model_data/resnet50_nobn.h5'
+outname = 'model_data/resnet50_nobn.fp16.h5'
 
 f = h5py.File(filename, 'r')
 out_f = h5py.File(outname, 'w')

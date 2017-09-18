@@ -47,9 +47,9 @@ from keras.applications.resnet50 import preprocess_input, decode_predictions
 
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
-RUN_CLASSIFIER = False
-PLOT_MODELS = True
-SAVE_ORIGINAL_MODEL = False
+RUN_CLASSIFIER = True
+PLOT_MODELS = False
+SAVE_ORIGINAL_MODEL = True
 
 #MODEL="TINY_YOLO"
 #MODEL="YOLO"
@@ -155,7 +155,6 @@ def predict_image(model, img_path):
   x = np.expand_dims(x, axis=0)
   x = preprocess_input(x)
   ddprint(str(x.shape))
-  x = preprocess_input(x)
 
   preds = model.predict(x)
 
@@ -441,24 +440,42 @@ for layer_name_, weights in weights_by_name.items():
 # Convert the weights and biases to Metal format.
 
 def export_layers(model, model_name, dst_path="Parameters"):
+  shape_info = {}
   for layer in model.layers:
     weights = layer.get_weights()
     if weights and len(weights):
       dprint("Exporting weights for layer "+layer.name+" type " + str(type(layer)))
     for i, w in enumerate(weights):
       if i % 2 == 0:
-        dprint("Weights shape:"+str(w.shape))
-        outpath = os.path.join(dst_path, "{}-{}.weights.bin".format(model_name,layer.name))
+        dprint("Keras weights shape:"+str(w.shape))
+        outfile = "{}-{}.weights.bin".format(model_name,layer.name)
+        outpath = os.path.join(dst_path, outfile)
         if type(layer) == Conv2D:
-          w.transpose(3, 0, 1, 2).tofile(outpath)
+          tw = w.transpose(3, 0, 1, 2)
+          dprint("iOS conv weights shape:"+str(tw.shape))
+          tw.tofile(outpath)
+          shape_info[outfile] = tw.shape
+        if type(layer) == Dense:
+          rw = w.reshape(1, 1, w.shape[0], w.shape[1])
+          dprint("intermediate weights shape:"+str(rw.shape))
+          tw = rw.transpose(3, 0, 1, 2)
+          dprint("iOS weights shape:"+str(tw.shape))
+          tw.tofile(outpath)
+          shape_info[outfile] = tw.shape
         else:
           w.tofile(outpath)
+          shape_info[outfile] = tw.shape
       else:
         dprint("Biases shape:"+str(w.shape))
-        outpath = os.path.join(dst_path, "{}-{}.biases.bin".format(model_name,layer.name))
+        outfile = "{}-{}.biases.bin".format(model_name,layer.name)
+        outpath = os.path.join(dst_path, outfile)
         w.tofile(outpath)
+        shape_info[outfile] = tw.shape
+  with open(os.path.join(dst_path, "shapes.json"), "w") as json_file:
+    print(pretty(shape_info), file=json_file)
 
 export_layers(new_model, model_name)
+export_layers(model, model_name, "OrigParameters")
 
 class_of_layer = {}
 layer_with_name = {}
@@ -978,30 +995,6 @@ class ForgeInput(ForgeLayer):
     input_already_defined = True
     return src
    
-'''
-def inputSource(width, height, name):
-  if input_already_defined:
-    raise RuntimeError("Forge supports only one input but network has multiple inputs")
-  src = []
-  src.append("let input = Input()")
-  # inception V3 wants input scaled between -1 and 1, but we can not
-  # know that from the model; there is nothing about that in the input config
-  if MODEL == "INCEPTION_V3":
-    src.append("let {} = input --> Resize(width: {}, height: {}) --> Activation(input_scale)"\
-                  .format(name, width, height))
-  else:
-    src.append("let {} = input --> Resize(width: {}, height: {})"\
-                  .format(name, width, height))
-  dprint(src)
-  input_defined = True
-  return src
-
-def inputSourceFromConfig(layer):
-  cfg = layer.get_config()
-  dprint(pretty(cfg))
-  return inputSource(cfg["batch_input_shape"][1], cfg["batch_input_shape"][2], layer_name(layer))
-'''
-
 # start swift source generation
 
 swift_src = []
@@ -1068,7 +1061,7 @@ for index, layer in enumerate(new_model.layers):
     elif type(layer) == Dense:
       swift_obj = ForgeDense(layer)
     elif type(layer) in [Add, Multiply, Average, Maximum, Flatten]:
-      source_obj_of[layer.name] = ForgeLayer(layer, type(layer), {})
+      source_obj_of[layer.name] = ForgeLayer(layer, layer.__class__.__name__, {})
       dprint(str(type(layer))+" layer '"+name+"' will not be predefined here")
     elif layer.__class__.__name__ == "Concatenate":
       source_obj_of[layer.name] = ForgeLayer(layer, "Concatenate", {})
@@ -1090,7 +1083,6 @@ swift_src.append("do {")
 
 ignore_layer_types = ["Flatten"]
 
-
 dot = None
 if PLOT_MODELS:
   dot = pydot.Dot()
@@ -1099,15 +1091,34 @@ if PLOT_MODELS:
   dot.set_node_defaults(shape='record')
 
 def addDotNode(layer_name, layer_type, attributes):
-  print("addDotNode:", layer_name, layer_type, attributes)
-  label = '{}(name={})'.format(layer_type, layer_name)
+  #print("addDotNode:", layer_name, layer_type, attributes)
+  forge_type = layer_type
+  shape = ""
+  if layer_name in source_obj_of:
+    forge_type = source_obj_of[layer_name].forge_class
+    shape = source_obj_of[layer_name].layer.output_shape
+    print("shape:", shape)
+    if len(shape) == 4:
+      shape = [shape[i] for i in (1,2,3,0)]
+    elif len(shape) == 3:
+      shape = [shape[i] for i in (1,2,0)]
+    elif len(shape) == 2:
+      shape = [shape[i] for i in (1,0)]
+    else:
+      raise RuntimeError("strange output shape:"+str(shape))
+
+    shape = "\\n"+str(shape).replace("None","1")
+  label = '{} : {}{}'.format(layer_name, forge_type,shape)
+  #print("label:", label)
   node = pydot.Node(layer_name, label=label)
+  if attributes["bold_frame"] == True:
+    node.set("penwidth", 3)
   dot.add_node(node)
 
 edges = []
 
 def addDotEdge(from_node, to_node, attributes):
-  print("addDotEdge:", from_node, to_node, attributes)
+  #print("addDotEdge:", from_node, to_node, attributes)
   edge = pydot.Edge(from_node, to_node)
   edges.append(edge)
 
@@ -1130,7 +1141,7 @@ for section in sections:
         if index < len(section.layers)-1:
           line += " --> "
       if PLOT_MODELS:
-        addDotNode(layer_id, class_of_layer[layer_id], {"pos":1})
+        addDotNode(layer_id, class_of_layer[layer_id], {"bold_frame": layer_id == var_name, "pos":1})
         if prev_id:
           addDotEdge(prev_id, layer_id, {"pos":3})
         prev_id = layer_id
@@ -1138,20 +1149,23 @@ for section in sections:
   elif isinstance(section, ConcatSection):
     layer = layer_with_name[section.name]
     layer_class = class_of_layer[layer.name]
-    merge_function = "Concatenate" if layer_class == "Concat" else "Collect"
+    merge_function = "Concatenate" if layer_class == "Concatenate" else "Collect"
 
+    #print("layer:", str(layer))
+    #print("merge_function:", merge_function)
+    #print("layer_class:", layer_class)
+    #print("section", pretty(section))
     collector = None
     if PLOT_MODELS:
       collector = section.name
       if merge_function != "Concatenate":
         collector = "for_"+section.name
-        addDotNode(collector, "Collect", {"pos":2})
-      #addDotNode(section.name, layer_class, {})
+        addDotNode(collector, "Collect", {"bold_frame": False ,"pos":2})
 
     line = "let "+var_name + " = {}([".format(merge_function)
     for index, layer_id in enumerate(section.layers):
       if PLOT_MODELS:
-        addDotEdge(layer_id, collector, {"pos":4})
+        addDotEdge(layer_id, collector, {"bold_frame": layer_id == var_name,"pos":4})
       line += layer_id
       if index < len(section.layers)-1:
         line += ", "
@@ -1174,10 +1188,15 @@ last_layer = model.layers[-1]
 if type(last_layer) == Dense and last_layer.get_config()["activation"] == "softmax":
   swift_src.append("let output = {} --> Softmax()".format(output_layers[0]))
   if PLOT_MODELS:
-    addDotNode("softmax_1", "Softmax", {"pos":6})
+    addDotNode("softmax_1", "Softmax", {"bold_frame": False, "pos":6})
     addDotEdge(output_layers[0], "softmax_1", {"pos":7})
+    addDotNode("output", "Tensor", {"bold_frame": True, "pos":8})
+    addDotEdge("softmax_1", "output",{"pos":9})
 else:
   swift_src.append("let output = {}".format(output_layers[0]))
+  if PLOT_MODELS:
+    addDotNode("output", "Tensor", {"bold_frame": True, "pos":8})
+    addDotEdge(output_layers[0], "output", {"pos":7})
 
 swift_src.append("model = Model(input: input, output: output)")
 swift_src.append("}")
@@ -1200,6 +1219,11 @@ if PLOT_MODELS:
   addAllEdges()
   to_file=changed_extension(file_name_plus(model_path,'_forge'),'.png')
   dot.write(to_file, format="png")
+  print("dot file:")
+  print("-------------------------------------------------------------")
+  print(dot.to_string())
+  print("-------------------------------------------------------------")
+
 
 # Make a prediction using the original model and also using the model that
 # has batch normalization removed, and check that the differences between
