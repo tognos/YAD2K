@@ -51,6 +51,9 @@ RUN_CLASSIFIER = True
 PLOT_MODELS = False
 SAVE_ORIGINAL_MODEL = True
 
+PARAMETERS_OUT_DIR = "Parameters2"
+PARAMETERS_ORIG_OUT_DIR = "ParametersOrig2"
+
 #MODEL="TINY_YOLO"
 #MODEL="YOLO"
 #as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
@@ -361,14 +364,14 @@ for index, layer in enumerate(model.layers):
     if not layer.get_weights():
       # layer has no weights, so we just clone it and instantiate
       # and connect it using the keras functional API
-      dprint("Layer '"+layer.__class__.__name__+" has no weights")
+      dprint("Layer '"+layer.__class__.__name__+"' has no weights")
       new_layer = layer_clone(layer)
       inputs = input_layers_outputs(inbounds, output_by_name)
       register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
     else:
       # layer has weights, so we might have to do some optimization
       weight_shape = np.shape(layer.get_weights())
-      dprint("Layer '"+layer.__class__.__name__+" weight shape:"+str(weight_shape))
+      dprint("Layer '"+layer.__class__.__name__+"' weight shape:"+str(weight_shape))
       layer_done = False
       #print("orig_inputs:"+str(orig_inputs)+", class "+str(orig_inputs.__class__))
       #print("BNTEST:"+layer.__class__.__name__ +" "+ orig_inputs.__class__.__name__)
@@ -432,6 +435,14 @@ for layer_name_, weights in weights_by_name.items():
   #print("orig_weights:"+str(np.shape(layer_by_name[layer_name_].get_weights())))
   layer_by_name[layer_name_].set_weights(weights)
 
+# for some unknow reasons, ndarray.tofile() under unclear circumstances writes out things in strange
+# order that is neither C or F, so we have the use this explicit conversion to get the result
+# which we expect
+def write_np_array(the_array, the_file_path):
+  c_bytes = the_array.astype(np.float32).tobytes("C")
+  with open(the_file_path, "wb") as f:
+    f.write(c_bytes)
+
 # The original model has batch normalization layers. We will now create
 # a new model without batch norm. We will fold the parameters for each
 # batch norm layer into the conv layer before it, so that we don't have
@@ -439,31 +450,81 @@ for layer_name_, weights in weights_by_name.items():
 #
 # Convert the weights and biases to Metal format.
 
-def export_layers(model, model_name, dst_path="Parameters"):
+def export_layers(the_model, model_name, dst_path):
+  if not os.path.exists(dst_path):
+    print('Creating output path {} for weights and biases'.format(dst_path))
+    os.mkdir(dst_path)
+   
+
+  inbounds = find_inbound_layers(the_model)
+
   shape_info = {}
-  for layer in model.layers:
+  for layer in the_model.layers:
     weights = layer.get_weights()
     if weights and len(weights):
       dprint("Exporting weights for layer "+layer.name+" type " + str(type(layer)))
+      dprint("layer config:" +pretty(layer.get_config())) 
+      dprint("Layer '{}' has {} weight arrays".format(layer.name, len(weights)))
     for i, w in enumerate(weights):
       if i % 2 == 0:
+        # In "th" format convolutional kernels have the shape (depth, input_depth, rows, cols)
+        # In "tf" format convolutional kernels have the shape (rows, cols, input_depth, depth)
         dprint("Keras weights shape:"+str(w.shape))
         outfile = "{}-{}.weights.bin".format(model_name,layer.name)
         outpath = os.path.join(dst_path, outfile)
         if type(layer) == Conv2D:
+          tw = w
+          #if layer.get_config()["data_format"] == "channels_last":
+          #elif layer.get_config()["data_format"] == "channels_first":
+          #else:
+          #  raise RuntimeError("unknown kernel weight format")
           tw = w.transpose(3, 0, 1, 2)
           dprint("iOS conv weights shape:"+str(tw.shape))
-          tw.tofile(outpath)
+          write_np_array(tw, outpath)
+          '''
+          twc_bytes = tw.astype(np.float32).tobytes("C")
+          twf_bytes = tw.astype(np.float32).tobytes("F")
+          with open(outpath+".F", "wb") as f:
+              f.write(twf_bytes)
+          with open(outpath+".C", "wb") as f:
+              f.write(twc_bytes)
+          tw.astype(np.float32).tofile(outpath)
+          '''
           shape_info[outfile] = tw.shape
         if type(layer) == Dense:
-          rw = w.reshape(1, 1, w.shape[0], w.shape[1])
-          dprint("intermediate weights shape:"+str(rw.shape))
-          tw = rw.transpose(3, 0, 1, 2)
-          dprint("iOS weights shape:"+str(tw.shape))
-          tw.tofile(outpath)
-          shape_info[outfile] = tw.shape
+          input_channels =  w.shape[0]
+          output_channels = w.shape[1]
+          input_layer = the_model.get_layer(inbounds[layer.name][0])
+          print("input_layer.name",input_layer.name)
+          if type(input_layer) == Flatten:
+            input_layer = the_model.get_layer(inbounds[input_layer.name][0])
+            print("input_layer.name",input_layer.name)
+          fc_in_shape = input_layer.output_shape
+          print("fc_in_shape",str(fc_in_shape))
+          conv_outputs = fc_in_shape[3]
+          conv_height = fc_in_shape[2]
+          output_width = fc_in_shape[1]
+          fc_shape = (output_channels, conv_outputs, conv_height, output_width)
+          print("fc_shape",str(fc_shape))
+          rw = w.reshape(fc_shape)
+          dprint("intermediate weights shape rw:"+str(rw.shape))
+          rwt = rw.transpose(0, 2, 3, 1)
+          dprint("intermediate weights shape rwt:"+str(rwt.shape))
+          rrwt = rw.reshape(output_channels, input_channels)
+          dprint("iOS weights shape:"+str(rrwt.shape))
+
+          ''' 
+          channels_in = 7*7*50
+          channels_out = 320
+          fc_shape = (320, 50, 7, 7)
+          metal_weights = trained_weights.reshape(fc_shape).transpose(0, 2, 3, 1).reshape(channels_out, channels_in)
+          '''
+
+          write_np_array(rrwt, outpath)
+          shape_info[outfile] = rrwt.shape
         else:
-          w.tofile(outpath)
+          #w.tofile(outpath)
+          write_np_array(w, outpath)
           shape_info[outfile] = tw.shape
       else:
         dprint("Biases shape:"+str(w.shape))
@@ -474,8 +535,8 @@ def export_layers(model, model_name, dst_path="Parameters"):
   with open(os.path.join(dst_path, "shapes.json"), "w") as json_file:
     print(pretty(shape_info), file=json_file)
 
-export_layers(new_model, model_name)
-export_layers(model, model_name, "OrigParameters")
+export_layers(new_model, model_name, PARAMETERS_OUT_DIR)
+export_layers(model, model_name, PARAMETERS_ORIG_OUT_DIR)
 
 class_of_layer = {}
 layer_with_name = {}
@@ -591,21 +652,6 @@ outbound_by_name = outbound_layers(inbound_by_name)
 dprint("outbound_by_name:")
 dprint(pretty(outbound_by_name))
 dprint()
-
-# filters 
-#
-'''
-def filter_duplicates(existing, new):
-  result = []
-  for section in new:
-    exists = False
-    for existing_section in existing:
-      if existing_section == section:
-        exists = True
-    if not exists:
-      result.append(section)
-  return result
-'''
 
 class ChainSection(dict):
   def __init__(self, name, layers):
