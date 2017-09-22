@@ -11,16 +11,12 @@ from keras.layers import Flatten
 from keras.layers.advanced_activations import LeakyReLU, ELU, ThresholdedReLU
 from keras.models import Model
 from keras import layers
-from keras.preprocessing import image
-from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
 from collections import OrderedDict
 import copy
 from PIL import Image
 import imghdr
 
-from keras.applications.resnet50 import ResNet50
 from keras.preprocessing import image
-from keras.applications.resnet50 import preprocess_input, decode_predictions
 from keras import backend as K
 
 import read_activations as du
@@ -42,7 +38,8 @@ def changed_extension(path_name, new_extension):
 #as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
 #and gives meaningless predictions
 #MODEL="INCEPTION_V3"
-MODEL="RESNET_50"
+#MODEL="RESNET_50"
+MODEL="VGG16"
 
 model_path = None
 test_out_dir=None
@@ -58,20 +55,31 @@ if MODEL == "TINY_YOLO":
   model = load_model(model_path)
 
 if MODEL=="INCEPTION_V3":
+  from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
   model_name = "inception_v3"
   model_path = "model_data/inception_v3.h5"
   model = InceptionV3(weights='imagenet')
 
 if MODEL=="RESNET_50":
+  from keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
   model_name = "resnet_50"
   if K.floatx() == "float16":
     model_path = "model_data/resnet50_nobn.fp16.h5"
   else:
     model_path = "model_data/resnet50.h5"
+
+if MODEL=="VGG16":
+  from keras.applications.vgg16 import VGG16, preprocess_input, decode_predictions
+  model_name = "vgg_16"
+  if K.floatx() == "float16":
+    model_path = "model_data/vgg_16_nobn.fp16.h5"
+  else:
+    model_path = "model_data/vgg_16.h5"
+  model = VGG16(weights='imagenet')
+
   
 if USE_ORIG_MODEL:
   model = load_model(model_path)
-  #model = ResNet50(weights='imagenet')
   test_out_dir="test_out_orig"
 else:
   if K.floatx() == "float16":
@@ -127,6 +135,11 @@ def load_input_from_floats(path, input_shape):
   data = data.reshape(input_shape)
   return data
 
+def write_np_array(the_array, the_file_path):
+  c_bytes = the_array.astype(np.float32).tobytes("C")
+  with open(the_file_path, "wb") as f:
+    f.write(c_bytes)
+
 def predict_image(model, img_path, output_dir):
   if not os.path.exists(output_dir):
     os.makedirs(output_dir)
@@ -167,7 +180,7 @@ def predict_image(model, img_path, output_dir):
     print("out_trans: ", out_trans.shape, out_trans.dtype)
     print("Saving features to "+testout_path)
     #out_tests.tofile(testout_path)
-    out_trans.tofile(testout_path)
+    write_np_array(out_trans, testout_path)
     shape_info[file_name] = out_trans.shape
 
   with open(os.path.join(output_dir, "shapes.json"), "w") as json_file:
@@ -191,6 +204,9 @@ if MODEL == "INCEPTION_V3" or MODEL=="RESNET_50":
   #predict_image(model, os.path.join("images/classify", "zebra.jpg"))
   #predict_image(model, "/Users/pavel/Downloads/resnet-50/resnet_50-subtract_mean.floats", "test_out-fp16")
   predict_image(model, "/Users/pavel/Downloads/resnet-50/resnet_50-subtract_mean.floats", test_out_dir)
+else:
+  #predict_image(model, os.path.join("images/classify", "car.jpg"), test_out_dir)
+  predict_image(model, os.path.join("images/classify", "/Users/pavel/Downloads/vgg_16/vgg_16-subtract_mean.floats"), test_out_dir)
 
 ############
 

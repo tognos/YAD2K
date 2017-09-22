@@ -35,15 +35,12 @@ from keras.layers.advanced_activations import LeakyReLU, ELU, ThresholdedReLU
 from keras.models import Model
 from keras import layers
 from keras.preprocessing import image
-from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
 from collections import OrderedDict
 import copy
 from PIL import Image
 import imghdr
 
-from keras.applications.resnet50 import ResNet50
 from keras.preprocessing import image
-from keras.applications.resnet50 import preprocess_input, decode_predictions
 
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
@@ -59,7 +56,11 @@ PARAMETERS_ORIG_OUT_DIR = "ParametersOrig2"
 #as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
 #and gives meaningless predictions
 #MODEL="INCEPTION_V3"
-MODEL="RESNET_50"
+#MODEL="RESNET_50"
+MODEL="VGG16"
+
+CAFFE_MODEL = False # when true, code for input channel swap RGB->BGR will be generated
+IMAGENET_MODEL = False # when true, code for imagenet mean subtraction will be generated
 
 if MODEL == "YOLO":
   model_name = "yolo"
@@ -72,6 +73,9 @@ if MODEL == "TINY_YOLO":
   model = load_model(model_path)
 
 if MODEL=="INCEPTION_V3":
+  from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
+  CAFFE_MODEL = True
+  IMAGENET_MODEL = True
   model_name = "inception_v3"
   model_path = "model_data/inception_v3.h5"
   model = InceptionV3(weights='imagenet')
@@ -79,11 +83,25 @@ if MODEL=="INCEPTION_V3":
     model.save(model_path)
 
 if MODEL=="RESNET_50":
+  from keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
+  CAFFE_MODEL = True
+  IMAGENET_MODEL = True
   model_name = "resnet_50"
   model_path = "model_data/resnet50.h5"
   model = ResNet50(weights='imagenet')
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
+
+if MODEL=="VGG16":
+  from keras.applications.vgg16 import VGG16, preprocess_input, decode_predictions
+  CAFFE_MODEL = True
+  IMAGENET_MODEL = True
+  model_name = "vgg_16"
+  model_path = "model_data/vgg_16.h5"
+  model = VGG16(weights='imagenet')
+  if SAVE_ORIGINAL_MODEL:
+    model.save(model_path)
+
 
 def file_name_plus(path_name, name_extension):
   path_file, extension = os.path.splitext(path_name)
@@ -177,7 +195,7 @@ def predict_in_dir(models, image_dir):
     for model in models:
       predict_image(model, os.path.join(image_dir, image_file))
 
-if MODEL == "INCEPTION_V3" or MODEL=="RESNET_50":
+if MODEL != "YOLO" and MODEL!="TINY_YOLO":
   #compare_features_fast(features, features_auto)
   if RUN_CLASSIFIER:
     predict_in_dir([model], "images/classify")
@@ -361,6 +379,16 @@ for index, layer in enumerate(model.layers):
     # the layer has at least one input
     orig_inputs = orig_input_layers(inbounds, model)
     #print("orig_inputs:"+str(orig_inputs))
+    if layer.__class__.__name__ != "BatchNormalization" and orig_inputs.__class__.__name__ == "Conv2D":
+      # conv without following batchnorm, set normal weights for previous conv layer
+      dprint("Conv2d layer without following batchnorm")
+      prev_orig_layer = model.get_layer(name=orig_inputs.name)
+      new_layer = layer_clone(prev_orig_layer)
+      prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
+      inputs = input_layers_outputs(prev_inbounds, output_by_name)
+      register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
+      weights_by_name[layer_name(new_layer)]=prev_orig_layer.get_weights()
+   
     if not layer.get_weights():
       # layer has no weights, so we just clone it and instantiate
       # and connect it using the keras functional API
@@ -370,8 +398,9 @@ for index, layer in enumerate(model.layers):
       register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
     else:
       # layer has weights, so we might have to do some optimization
-      weight_shape = np.shape(layer.get_weights())
-      dprint("Layer '"+layer.__class__.__name__+"' weight shape:"+str(weight_shape))
+      weights_list = layer.get_weights()
+      for i, w in enumerate(weights_list):
+        dprint("Layer '"+layer.__class__.__name__+"' weights/biases index "+str(i)+" of shape:"+str(w.shape))
       layer_done = False
       #print("orig_inputs:"+str(orig_inputs)+", class "+str(orig_inputs.__class__))
       #print("BNTEST:"+layer.__class__.__name__ +" "+ orig_inputs.__class__.__name__)
@@ -396,17 +425,6 @@ for index, layer in enumerate(model.layers):
         # add the name of the new layer as a replacement for the folded batchnorm layer
         replaced_layer[layer_name(layer)] = layer_name(prev_orig_layer)
         layer_done = True
-      else:
-        if orig_inputs.__class__.__name__ == "Conv2D":
-          # conv without following batchnorm, set normal weights for previous conv layer
-          dprint("Conv2d layer without following batchnorm")
-          prev_orig_layer = model.get_layer(name=orig_inputs)
-          new_layer = layer_clone(prev_orig_layer)
-          prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
-          inputs = input_layers_outputs(prev_inbounds, output_by_name)
-          register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
-          weights_by_name[layer_name(new_layer)]=prev_orig_layer.get_weights()
-      
       if not layer_done:
         # process all layer types except conv2d if not the last layer
         if layer.__class__.__name__ != "Conv2D" or index + 1 == len(model.layers):
@@ -473,64 +491,78 @@ def export_layers(the_model, model_name, dst_path):
         outfile = "{}-{}.weights.bin".format(model_name,layer.name)
         outpath = os.path.join(dst_path, outfile)
         if type(layer) == Conv2D:
+          print("Converting weights to metal for Conv2D layer") 
           tw = w
           #if layer.get_config()["data_format"] == "channels_last":
           #elif layer.get_config()["data_format"] == "channels_first":
           #else:
           #  raise RuntimeError("unknown kernel weight format")
           tw = w.transpose(3, 0, 1, 2)
-          dprint("iOS conv weights shape:"+str(tw.shape))
+          dprint("Metal conv weights shape:"+str(tw.shape))
           write_np_array(tw, outpath)
-          '''
-          twc_bytes = tw.astype(np.float32).tobytes("C")
-          twf_bytes = tw.astype(np.float32).tobytes("F")
-          with open(outpath+".F", "wb") as f:
-              f.write(twf_bytes)
-          with open(outpath+".C", "wb") as f:
-              f.write(twc_bytes)
-          tw.astype(np.float32).tofile(outpath)
-          '''
           shape_info[outfile] = tw.shape
-        if type(layer) == Dense:
+        elif type(layer) == Dense:
+          print("Converting weights to metal for Dense layer") 
+          # In metal there is no need for a flatten layer when CNN is fed to a dense layer,
+          # but the weights must be properly arranges depending on the input layer:
+          # The metal dense weights array: The number of entries is =
+          # inputFeatureChannels * outputFeatureChannels * kernelHeight * kernelWidth
+          # The layout of filter weight is so that it can be reinterpreted as 4D tensor (array)
+          # weight[ outputChannels ][ kernelHeight ][ kernelWidth ][ inputChannels / groups ]
+          # where kernelHeight and kernelWidth are equal to the width and height of the input shape
+          # In Metal, the output of the dense layer has width=1 height=1 and channnels=outputchannels
           input_channels =  w.shape[0]
           output_channels = w.shape[1]
+          print("input_channels=",input_channels)
+          print("output_channels=",output_channels)
           input_layer = the_model.get_layer(inbounds[layer.name][0])
           print("input_layer.name",input_layer.name)
+          metal_weights = None
           if type(input_layer) == Flatten:
+            print("Keras model has a Flatten layer, lets get the shape of its input")
             input_layer = the_model.get_layer(inbounds[input_layer.name][0])
-            print("input_layer.name",input_layer.name)
+            print("effective input_layer.name",input_layer.name)
           fc_in_shape = input_layer.output_shape
           print("fc_in_shape",str(fc_in_shape))
-          conv_outputs = fc_in_shape[3]
-          conv_height = fc_in_shape[2]
-          output_width = fc_in_shape[1]
-          fc_shape = (output_channels, conv_outputs, conv_height, output_width)
-          print("fc_shape",str(fc_shape))
-          rw = w.reshape(fc_shape)
-          dprint("intermediate weights shape rw:"+str(rw.shape))
-          rwt = rw.transpose(0, 2, 3, 1)
-          dprint("intermediate weights shape rwt:"+str(rwt.shape))
-          rrwt = rw.reshape(output_channels, input_channels)
-          dprint("iOS weights shape:"+str(rrwt.shape))
-
-          ''' 
-          channels_in = 7*7*50
-          channels_out = 320
-          fc_shape = (320, 50, 7, 7)
-          metal_weights = trained_weights.reshape(fc_shape).transpose(0, 2, 3, 1).reshape(channels_out, channels_in)
-          '''
-
-          write_np_array(rrwt, outpath)
-          shape_info[outfile] = rrwt.shape
+          if type(input_layer) != Dense:
+            print("Keras model input to dense layer is not a Dense layer, so we need to arrange the weigts to its output shape")
+            conv_outputs = fc_in_shape[3]
+            conv_height = fc_in_shape[2]
+            output_width = fc_in_shape[1]
+            fc_shape = (output_channels, conv_outputs, conv_height, output_width)
+            print("fc_shape",str(fc_shape))
+            rw = w.transpose().reshape(fc_shape)
+            dprint("intermediate weights shape rw:"+str(rw.shape))
+            rwt = rw.transpose(0, 2, 3, 1)
+            dprint("intermediate weights shape rwt:"+str(rwt.shape))
+            rrwt = rw.reshape(output_channels, input_channels)
+            metal_weights = rrwt
+            ''' 
+            channels_in = 7*7*50
+            channels_out = 320
+            fc_shape = (320, 50, 7, 7)
+            metal_weights = trained_weights.reshape(fc_shape).transpose(0, 2, 3, 1).reshape(channels_out, channels_in)
+            '''
+          else:
+            print("Keras model input to Dense layer is a another Dense layer")
+            metal_weights = w.transpose()
+          dprint("Metal weights shape:"+str(metal_weights.shape))
+          write_np_array(metal_weights, outpath)
+          shape_info[outfile] = metal_weights.shape
         else:
-          #w.tofile(outpath)
-          write_np_array(w, outpath)
+          # Keras Dense weight have shape (inputs, outputs)
+          # Metal Dense weight have shape (outputs, inputs)
+          tw = w.transpose()
+          dprint("Saving weights for other layer than Conv2D or Dense, keras shape:"+
+                 str(w.shape)+", metal shape:"+str(tw.shape))
+          write_np_array(tw, outpath)
           shape_info[outfile] = tw.shape
       else:
         dprint("Biases shape:"+str(w.shape))
         outfile = "{}-{}.biases.bin".format(model_name,layer.name)
         outpath = os.path.join(dst_path, outfile)
-        w.tofile(outpath)
+        write_np_array(w, outpath)
+        #w.tofile(outpath)
         shape_info[outfile] = tw.shape
   with open(os.path.join(dst_path, "shapes.json"), "w") as json_file:
     print(pretty(shape_info), file=json_file)
@@ -556,7 +588,7 @@ def gather_activations(model):
       activation = layer.get_config()['activation']
       activations.add(activation)
       activation_of_layer[layer_name(layer)] = activation
-      if activation == "linear":
+      if activation == "linear" or activation == "softmax":
         params = {"metal_func": "nil",
                   "swift_prefix": "nil"}
       elif activation == "relu":
@@ -1002,10 +1034,12 @@ class ForgeSpaceToDepthX2(ForgeLayer):
 #   useBias: Bool = true,
 #   name: String = "")
 class ForgeDense(ForgeLayer):
-  def __init__(self, layer):
+  def __init__(self, layer, var_name_of_activation):
     params = OrderedDict([ 
       ("neurons" , ("units",)),
       ("useBias" , ("use_bias", True)),
+      ("activation", ("", "nil", 
+        var_name_of_activation[activation_of_layer[activation_layer(layer.name)]])),
       ("name"    , ("name","",quote_string))
     ])
     super().__init__(layer, "Dense", params)
@@ -1028,8 +1062,21 @@ class ForgeInput(ForgeLayer):
       raise RuntimeError("Forge supports only one input but network has multiple inputs")
     src = []
     src.append("let input = Input()")
+    if CAFFE_MODEL:
+      src.append('let swap_channels = Custom(TransposeChannelsKernel('
+                 'device: device, featureChannels: 3, permute: [2,1,0]), name: "rgb2bgr")')
+
+    if IMAGENET_MODEL:
+      src.append('let subtract_mean = Custom(SubtractMeanColor('
+        'device:device, red: 123.68, green: 116.779, blue: 103.939, scale: 255.0), '
+        'name: "subtract_mean")')
+
     # "let {} = input --> Resize(width: {}, height: {})"
     line = super().swift_source()[0].replace("Input", "input --> Resize")
+    if CAFFE_MODEL:
+      line += " -->  swap_channels"
+    if IMAGENET_MODEL:
+      line += " -->  subtract_mean"
     
     # inception V3 wants input scaled between -1 and 1, but we can not
     # know that from the model; there is nothing about that in the input config
@@ -1105,7 +1152,7 @@ for index, layer in enumerate(new_model.layers):
     elif type(layer) == GlobalAveragePooling2D:
       swift_obj = ForgeGlobalAveragePooling2D(layer)
     elif type(layer) == Dense:
-      swift_obj = ForgeDense(layer)
+      swift_obj = ForgeDense(layer, var_name_of_activation)
     elif type(layer) in [Add, Multiply, Average, Maximum, Flatten]:
       source_obj_of[layer.name] = ForgeLayer(layer, layer.__class__.__name__, {})
       dprint(str(type(layer))+" layer '"+name+"' will not be predefined here")
@@ -1314,7 +1361,7 @@ def compare_features_yolo(features1, features2):
           print(i, j, k, ":", features1[0, i, j, k], features2[0, i, j, k], diff)
   print("Largest error:", max_error)
 
-if MODEL == "INCEPTION_V3" or MODEL=="RESNET_50":
+if MODEL != "YOLO" and MODEL!="TINY_YOLO":
   compare_features_fast(features, features_auto)
   if RUN_CLASSIFIER:
     predict_in_dir([model, new_model], "images/classify")
