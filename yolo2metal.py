@@ -45,7 +45,7 @@ from keras.preprocessing import image
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
 RUN_CLASSIFIER = True
-PLOT_MODELS = False
+PLOT_MODELS = True
 SAVE_ORIGINAL_MODEL = True
 
 PARAMETERS_OUT_DIR = "Parameters2"
@@ -56,8 +56,8 @@ PARAMETERS_ORIG_OUT_DIR = "ParametersOrig2"
 #as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
 #and gives meaningless predictions
 #MODEL="INCEPTION_V3"
-#MODEL="RESNET_50"
-MODEL="VGG16"
+MODEL="RESNET_50"
+#MODEL="VGG16"
 
 CAFFE_MODEL = False # when true, code for input channel swap RGB->BGR will be generated
 IMAGENET_MODEL = False # when true, code for imagenet mean subtraction will be generated
@@ -379,9 +379,11 @@ for index, layer in enumerate(model.layers):
     # the layer has at least one input
     orig_inputs = orig_input_layers(inbounds, model)
     #print("orig_inputs:"+str(orig_inputs))
-    if layer.__class__.__name__ != "BatchNormalization" and orig_inputs.__class__.__name__ == "Conv2D":
+    if layer.__class__.__name__ != "BatchNormalization" and\
+        orig_inputs.__class__.__name__ == "Conv2D" and\
+        orig_inputs.name not in weights_by_name:
       # conv without following batchnorm, set normal weights for previous conv layer
-      dprint("Conv2d layer without following batchnorm")
+      dprint("Conv2d layer without following batchnorm, set orig weight for layer ", orig_inputs.name)
       prev_orig_layer = model.get_layer(name=orig_inputs.name)
       new_layer = layer_clone(prev_orig_layer)
       prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
