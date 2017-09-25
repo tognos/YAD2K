@@ -38,8 +38,8 @@ def changed_extension(path_name, new_extension):
 #as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
 #and gives meaningless predictions
 #MODEL="INCEPTION_V3"
-#MODEL="RESNET_50"
-MODEL="VGG16"
+MODEL="RESNET_50"
+#MODEL="VGG16"
 
 model_path = None
 test_out_dir=None
@@ -203,7 +203,7 @@ if MODEL == "INCEPTION_V3" or MODEL=="RESNET_50":
   #predict_in_dir([model], "images/classify")
   #predict_image(model, os.path.join("images/classify", "zebra.jpg"))
   #predict_image(model, "/Users/pavel/Downloads/resnet-50/resnet_50-subtract_mean.floats", "test_out-fp16")
-  predict_image(model, "/Users/pavel/Downloads/resnet-50/resnet_50-subtract_mean.floats", test_out_dir)
+  predict_image(model, "/Users/pavel/Downloads/resnet50/resnet_50-subtract_mean.floats", test_out_dir)
 else:
   #predict_image(model, os.path.join("images/classify", "car.jpg"), test_out_dir)
   predict_image(model, os.path.join("images/classify", "/Users/pavel/Downloads/vgg_16/vgg_16-subtract_mean.floats"), test_out_dir)

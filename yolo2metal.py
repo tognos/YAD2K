@@ -55,8 +55,8 @@ PARAMETERS_ORIG_OUT_DIR = "ParametersOrig2"
 #MODEL="YOLO"
 #as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
 #and gives meaningless predictions
-#MODEL="INCEPTION_V3"
-MODEL="RESNET_50"
+MODEL="INCEPTION_V3"
+#MODEL="RESNET_50"
 #MODEL="VGG16"
 
 CAFFE_MODEL = False # when true, code for input channel swap RGB->BGR will be generated
@@ -526,8 +526,8 @@ def export_layers(the_model, model_name, dst_path):
             print("effective input_layer.name",input_layer.name)
           fc_in_shape = input_layer.output_shape
           print("fc_in_shape",str(fc_in_shape))
-          if type(input_layer) != Dense:
-            print("Keras model input to dense layer is not a Dense layer, so we need to arrange the weigts to its output shape")
+          if type(input_layer) != Dense and layer.__class__.__name__ == "Concatenate":
+            print("Keras model input to dense layer is not a Dense or Concatenate layer, so we need to arrange the weigts to its output shape")
             conv_outputs = fc_in_shape[3]
             conv_height = fc_in_shape[2]
             output_width = fc_in_shape[1]
@@ -1110,7 +1110,7 @@ for activation in activations:
   if 'swift_prefix' in params and params['swift_prefix']:
     prefix = params['swift_prefix']
 
-    if prefix in used_prefix_counter.keys():
+    if prefix != "nil" and prefix in used_prefix_counter.keys():
       next_prefix = used_prefix_counter[prefix] + 1
       prefix = prefix + "_" + str(used_prefix_counter[prefix])
       used_prefix_counter[prefix] = next_prefix
