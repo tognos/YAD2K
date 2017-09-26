@@ -61,7 +61,8 @@ PARAMETERS_ORIG_OUT_DIR = "ParametersOrig"
 
 parser = argparse.ArgumentParser(description='Convert Keras Models to Forge Metal Models',
                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('model', choices=['TINY_YOLO', 'YOLO', 'INCEPTION_V3', 'RESNET_50','VGG16'])
+parser.add_argument('model',
+  choices=['TINY_YOLO', 'YOLO', 'INCEPTION_V3', 'RESNET_50','VGG16','INCEPTION_RESNET_V2'])
 parser.add_argument('--param_dir', default="Parameters",
                   help='Path to directory to write the metal weights for optimized models')
 parser.add_argument('--orig_param_dir', default="OriginalParameters",
@@ -82,6 +83,9 @@ parser.add_argument( '-s', '--save_orig_models', help='save also the non-optimiz
                 action='store_true', default = False)
 parser.add_argument( '-e', '--export_orig_weigths', help='export also the non-optimized model weigths',
                 action='store_true', default = False)
+parser.add_argument( '-q', '--quick_run', help='skip optimzed model generation and weight export reusing model from previous run',
+                action='store_true', default = False)
+
 
 
 opts = parser.parse_args(sys.argv[1:])
@@ -95,6 +99,7 @@ RUN_CLASSIFIER=opts.run_classifier
 MODEL_DIR=opts.model_dir
 EXPORT_ORIGINAL_WEIGHTS=opts.export_orig_weigths
 IMAGE_DIR=opts.image_dir
+QUICK_RUN=opts.quick_run
 
 SWAP_INPUT_IMAGE_CHANNELS = False # when true, code for input channel swap RGB->BGR will be generated
 SUBTRACT_IMAGENET_MEAN = False # when true, code for imagenet mean subtraction will be generated
@@ -118,6 +123,16 @@ if MODEL=="INCEPTION_V3":
   model = InceptionV3(weights='imagenet')
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
+
+if MODEL=="INCEPTION_RESNET_V2":
+  from keras.applications.inception_resnet_v2 import InceptionResNetV2, preprocess_input, decode_predictions
+  SCALE_INPUT_TO_MINUS_1_AND_1 = True
+  model_name = "inception_resnet_v2"
+  model_path = MODEL_DIR+"/inception_resnet_v2.h5"
+  model = InceptionResNetV2(weights='imagenet')
+  if SAVE_ORIGINAL_MODEL:
+    model.save(model_path)
+
 
 if MODEL=="RESNET_50":
   from keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
@@ -207,7 +222,8 @@ def dddprint(*args, **kwargs):
 def predict_image(model, img_path):
   batch_input_shape = model.layers[0].get_config()['batch_input_shape']
   input_shape = batch_input_shape[1:3]
-
+  if input_shape[0] == None or input_shape[1] == None:
+    input_shape = (299,299)
   dprint("Loading "+img_path)
   img = image.load_img(img_path, target_size=input_shape)
   x = image.img_to_array(img)
@@ -360,6 +376,7 @@ def input_layers_outputs(inbound_names, layer_by_name):
     return result
 
 # return layers from model specified by inbound_names 
+'''
 def orig_input_layers(inbound_names, model):
   if len(inbound_names) == 1:
     result = model.get_layer(name=inbound_names[0])
@@ -371,6 +388,13 @@ def orig_input_layers(inbound_names, model):
       result.append(model.get_layer(name=iname))
     #print("orig_input_layers: returning single result: "+str(result))
     return result
+'''
+def orig_input_layers(inbound_names, model):
+  result = []
+  for iname in inbound_names:
+    result.append(model.get_layer(name=iname))
+  return result
+
 
 inbound_by_name = find_inbound_layers(model)
 
@@ -395,105 +419,117 @@ def register_new_layer(the_name, the_layer, the_output):
   layer_by_name[the_name] = the_layer
   output_by_name[the_name] = the_output
 
-# iterate over all layers of the original model
-for index, layer in enumerate(model.layers):
-  #print("\n"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
-  dprint(str(index)+":"+layer.__class__.__name__+":"+layer_name(layer))
+if not QUICK_RUN:
+  # iterate over all layers of the original model
+  for index, layer in enumerate(model.layers):
+    #print("\n"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
+    dprint(str(index)+":"+layer.__class__.__name__+":"+layer_name(layer))
 
-  # get names of the inbound layers of our current layer
-  inbounds = replaced_name_list(inbound_by_name[layer_name(layer)], replaced_layer)
-  dprint("Inbounds:"+str(inbounds)+", len "+str(len(inbounds)))
+    # get names of the inbound layers of our current layer
+    inbounds = replaced_name_list(inbound_by_name[layer_name(layer)], replaced_layer)
+    dprint("Inbounds:"+str(inbounds)+", len "+str(len(inbounds)))
 
-  if len(inbounds) == 0:
-    # layer has no inbounds, so we assume it is an input layer
-    # and create a new input layer
-    batch_input_shape = layer.get_config()['batch_input_shape']
-    input_shape = batch_input_shape[1:]
-    dprint(str(input_shape), str(batch_input_shape))
-    new_layer = Input(shape=input_shape)
-    # Note: new_layer is actually the blob output of the input
-    register_new_layer(layer_name(layer), new_layer, new_layer)
-  else:
-    # the layer has at least one input
-    orig_inputs = orig_input_layers(inbounds, model)
-    #print("orig_inputs:"+str(orig_inputs))
-    if layer.__class__.__name__ != "BatchNormalization" and\
-        orig_inputs.__class__.__name__ == "Conv2D" and\
-        orig_inputs.name not in weights_by_name:
-      # conv without following batchnorm, set normal weights for previous conv layer
-      dprint("Conv2d layer without following batchnorm, set orig weight for layer ", orig_inputs.name)
-      prev_orig_layer = model.get_layer(name=orig_inputs.name)
-      new_layer = layer_clone(prev_orig_layer)
-      prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
-      inputs = input_layers_outputs(prev_inbounds, output_by_name)
-      register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
-      weights_by_name[layer_name(new_layer)]=prev_orig_layer.get_weights()
-   
-    if not layer.get_weights():
-      # layer has no weights, so we just clone it and instantiate
-      # and connect it using the keras functional API
-      dprint("Layer '"+layer.__class__.__name__+"' has no weights")
-      new_layer = layer_clone(layer)
-      inputs = input_layers_outputs(inbounds, output_by_name)
-      register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
+    if len(inbounds) == 0:
+      # layer has no inbounds, so we assume it is an input layer
+      # and create a new input layer
+      batch_input_shape = layer.get_config()['batch_input_shape']
+      input_shape = batch_input_shape[1:]
+      dprint(str(input_shape), str(batch_input_shape))
+      new_layer = Input(shape=input_shape)
+      # Note: new_layer is actually the blob output of the input
+      register_new_layer(layer_name(layer), new_layer, new_layer)
     else:
-      # layer has weights, so we might have to do some optimization
-      weights_list = layer.get_weights()
-      for i, w in enumerate(weights_list):
-        dprint("Layer '"+layer.__class__.__name__+"' weights/biases index "+str(i)+" of shape:"+str(w.shape))
-      layer_done = False
-      #print("orig_inputs:"+str(orig_inputs)+", class "+str(orig_inputs.__class__))
-      #print("BNTEST:"+layer.__class__.__name__ +" "+ orig_inputs.__class__.__name__)
-      
-      if layer.__class__.__name__ == "BatchNormalization" and orig_inputs.__class__.__name__ == "Conv2D":
-        # batchnorm following a conv2D layer
-        # we need to set folded weights for the previous conv layer
-        # which also has not been created yet
-        dprint("Folding batch norm layer")
-        prev_orig_layer = orig_input_layers(inbounds, model)
-        new_config = prev_orig_layer.get_config()
-        # we need our new conv layer to have bias
-        new_config['use_bias'] = True
-        # create a conv layer
-        new_layer = layers.deserialize({'class_name': prev_orig_layer.__class__.__name__,
-                                  'config': new_config})
-        prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
-        inputs = input_layers_outputs(prev_inbounds, output_by_name)
-        register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
-        dprint("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
-        weights_by_name[layer_name(new_layer)] = fold_batch_norm(prev_orig_layer, layer)
-        # add the name of the new layer as a replacement for the folded batchnorm layer
-        replaced_layer[layer_name(layer)] = layer_name(prev_orig_layer)
-        layer_done = True
-      if not layer_done:
-        # process all layer types except conv2d if not the last layer
-        if layer.__class__.__name__ != "Conv2D" or index + 1 == len(model.layers):
-          new_layer = layer_clone(layer)
-          inputs = input_layers_outputs(inbounds, output_by_name)
-          register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
-          dprint("appending new layer:"+new_layer.__class__.__name__)
+      # the layer has at least one input
+      orig_inputs = orig_input_layers(inbounds, model)
+      ddprint("orig_inputs:"+str(orig_inputs))
+      ddprint("orig_inputs class:"+str(type(orig_inputs)))
+      # check if we need to complete a skipped Conv2D without batchnorm
+      if layer.__class__.__name__ != "BatchNormalization":
+        for i in orig_inputs:
+          if i.__class__.__name__ == "Conv2D" and i.name not in weights_by_name:
+            # conv without following batchnorm, set normal weights for previous conv layer
+            dprint("Conv2d layer without following batchnorm, set orig weight for layer ",i.name)
+            prev_orig_layer = model.get_layer(name=i.name)
+            new_layer = layer_clone(prev_orig_layer)
+            prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
+            inputs = input_layers_outputs(prev_inbounds, output_by_name)
+            register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
+            weights_by_name[layer_name(new_layer)]=prev_orig_layer.get_weights()
+         
+      if not layer.get_weights():
+        # layer has no weights, so we just clone it and instantiate
+        # and connect it using the keras functional API
+        dprint("Layer '"+layer.__class__.__name__+"' has no weights")
+        new_layer = layer_clone(layer)
+        inputs = input_layers_outputs(inbounds, output_by_name)
+        register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
+      else:
+        # layer has weights, so we might have to do some optimization
+        weights_list = layer.get_weights()
+        for i, w in enumerate(weights_list):
+          dprint("Layer '"+layer.__class__.__name__+"' weights/biases index "+str(i)+" of shape:"+str(w.shape))
+        layer_done = False
+        #print("orig_inputs:"+str(orig_inputs)+", class "+str(orig_inputs.__class__))
+        #print("BNTEST:"+layer.__class__.__name__ +" "+ orig_inputs.__class__.__name__)
+        
+        if layer.__class__.__name__ == "BatchNormalization" and\
+            orig_inputs[0].__class__.__name__ == "Conv2D":
+          # batchnorm following a conv2D layer
+          # we need to set folded weights for the previous conv layer
+          # which also has not been created yet
+          dprint("Folding batch norm layer")
+          prev_orig_layer = orig_input_layers(inbounds, model)[0]
+          new_config = prev_orig_layer.get_config()
+          # we need our new conv layer to have bias
+          new_config['use_bias'] = True
+          # create a conv layer
+          new_layer = layers.deserialize({'class_name': prev_orig_layer.__class__.__name__,
+                                    'config': new_config})
+          prev_inbounds = replaced_name_list(inbound_by_name[layer_name(prev_orig_layer)],replaced_layer)
+          inputs = input_layers_outputs(prev_inbounds, output_by_name)
+          register_new_layer(layer_name(new_layer), new_layer, new_layer(inputs))
           dprint("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
-          weights_by_name[layer_name(layer)] = layer.get_weights()
+          weights_by_name[layer_name(new_layer)] = fold_batch_norm(prev_orig_layer, layer)
+          # add the name of the new layer as a replacement for the folded batchnorm layer
+          replaced_layer[layer_name(layer)] = layer_name(prev_orig_layer)
+          layer_done = True
+        if not layer_done:
+          # process all layer types except conv2d if not the last layer
+          if layer.__class__.__name__ != "Conv2D" or index + 1 == len(model.layers):
+            new_layer = layer_clone(layer)
+            inputs = input_layers_outputs(inbounds, output_by_name)
+            register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
+            dprint("appending new layer:"+new_layer.__class__.__name__)
+            dprint("adding weights for new layer index "+str(len(all_layers))+" type " + new_layer.__class__.__name__)
+            weights_by_name[layer_name(layer)] = layer.get_weights()
 
-# create our new model using the keras functional API
-new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
+  # create our new model using the keras functional API
+  new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
+else:
+  new_model = load_model(file_name_plus(model_path, "_nobn"))
+
 if DEBUG_OUT:
   new_model.summary()
 if PLOT_MODELS:
   plot_model(new_model, to_file=changed_extension(file_name_plus(model_path,'_new'),'.png'))
 
-ddprint("Replaced layers:"+str(replaced_layer))
+if not QUICK_RUN:
+  ddprint("Replaced layers:"+str(replaced_layer))
 
-# now actually set the weights for the new model layers
-# we have to do it after model instantiation because
-# the keras could not calculate the actual shapes
-# before the model was completely set up
-print("Setting weights for new model")
-for layer_name_, weights in weights_by_name.items():
-  dprint("Setting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
-  #print("weights     :"+str(np.shape(weights)))
-  #print("orig_weights:"+str(np.shape(layer_by_name[layer_name_].get_weights())))
-  layer_by_name[layer_name_].set_weights(weights)
+  # now actually set the weights for the new model layers
+  # we have to do it after model instantiation because
+  # the keras could not calculate the actual shapes
+  # before the model was completely set up
+  print("Setting weights for new model")
+  for layer_name_, weights in weights_by_name.items():
+    dprint("Setting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
+    #print("weights     :"+str(np.shape(weights)))
+    #print("orig_weights:"+str(np.shape(layer_by_name[layer_name_].get_weights())))
+    layer_by_name[layer_name_].set_weights(weights)
+
+if RUN_CLASSIFIER:
+  predict_in_dir([new_model], IMAGE_DIR)
+
 
 # for some unknow reasons, ndarray.tofile() under unclear circumstances writes out things in strange
 # order that is neither C or F, so we have the use this explicit conversion to get the result
@@ -611,8 +647,10 @@ def export_layers(the_model, model_name, dst_path):
   with open(os.path.join(dst_path, "shapes.json"), "w") as json_file:
     print(pretty(shape_info), file=json_file)
 
-print("Exporting weights for new model to '{}'".format(PARAMETERS_OUT_DIR))
-export_layers(new_model, model_name, PARAMETERS_OUT_DIR)
+if not QUICK_RUN:
+  print("Exporting weights for new model to '{}'".format(PARAMETERS_OUT_DIR))
+  export_layers(new_model, model_name, PARAMETERS_OUT_DIR)
+
 if EXPORT_ORIGINAL_WEIGHTS:
   print("Exporting weights for original model to '{}'".format(PARAMETERS_ORIG_OUT_DIR))
   export_layers(model, model_name, PARAMETERS_ORIG_OUT_DIR)
@@ -826,13 +864,13 @@ def consolidate_concats(section_dict, inbound_by_name, outbound_by_name):
   replaced_concat_of_concat = {}
   for section in section_dict.values():
     dprint("Consolidating section '{}'".format(section.name))
-    if isinstance(section, ConcatSection):
+    if isinstance(section, ConcatSection) and class_of_layer[section.name] == "Concatenate":
       out_bounds = outbound_by_name[section.name]
       goes_into_other_concat = any(class_of_layer[layer] == "Concatenate" for layer in out_bounds)
       has_concat_inputs = any(class_of_layer[layer] == "Concatenate" for layer in section.layers)
       ddprint("Consolidating section "+section.name,"goes_into_other_concat",goes_into_other_concat,"has_concat_inputs", has_concat_inputs)
       if goes_into_other_concat and has_concat_inputs:
-        raise RuntimeError("Can't deal with multi-layered Contcats")
+        raise RuntimeError("Can't yet deal with multi-layered Concats")
       if not goes_into_other_concat:
         if not has_concat_inputs:
           ddprint("Consolidating section "+section.name," has no concat inputs, just copying")
@@ -858,9 +896,13 @@ def consolidate_concats(section_dict, inbound_by_name, outbound_by_name):
       raw_sections.append(section)
   # replace all the names of concats that no longer exist with the new names
   for section in raw_sections:
+    ddprint("replacing names in section:", pretty(section))
+    if section.name in replaced_concat_of_concat:
+      ddprint("replacing name of section {} with {}".format(section.name, replaced_concat_of_concat[section.name]))
+      section.name = replaced_concat_of_concat[section.name]
     for index, layer in enumerate(section.layers):
       if layer in replaced_concat_of_concat:
-        section.layer[index] = replaced_concat_of_concat[layer]
+        section.layers[index] = replaced_concat_of_concat[layer]
   return raw_sections, replaced_concat_of_concat
         
 raw_sections, replaced_concat_of_concat = consolidate_concats(section_dict, inbound_by_name, outbound_by_name)
@@ -898,7 +940,7 @@ def referencing_sections(sections):
 # necessarily in the order we need them to declare them,
 # so we may have to sort them
 def sort_sections(sections):
-  referencing = referencing_sections(raw_sections)
+  referencing = referencing_sections(sections)
 
   order = []
 
@@ -915,24 +957,36 @@ def sort_sections(sections):
   # satisfied until we can't add a new section
   changed = True
   while changed:
+    ddprint("\nStart ordering pass:")
     changed = False
     for name in referencing:
-      #print("Checking "+ name)
+      ddprint("Checking references of section:"+ name)
       if not name in order:
+        # we have not yet resolved the references for this section 
         ok = True
+        # check all the references in this section
+        # if one is not resolved, we skip this section for later
         for ref in referencing[name]:
           #print("ref={}, referencing[{}]={}".format(ref, name, referencing[name]))
           if not ref in order:
+            ddprint("reference "+ ref + " is not yet defined")
             ok = False
             break
         if ok:    
+          ddprint("All references of section '"+ name+"' are defined")
           order.append(name)
           #print("order="+str(order))
           changed = True
 
   # We could not add any more sections, so we should have sorted them all
   # if not, we can't do anything better
-  assert len(order) == len(sections), "Could not resolve all references"
+  if len(order) != len(sections):
+    # there seem to be some unresolved references, check which ones
+    print("sections="+pretty(sections))
+    print("order so far="+str(order))
+    print("Total count:", len(sections))
+    print("Resolved count:", len(order))
+    assert False, "Could not resolve all references"
 
   # so far we only gather section names by order, now bring the sections
   # themselves in suitable order
@@ -1253,6 +1307,9 @@ for index, layer in enumerate(new_model.layers):
       ddprint("Concatenate layer '"+name+"' will not be predefined here")
     elif type(layer) == Activation:
       swift_obj = ForgeActivation(layer, var_name_of_activation)
+    elif type(layer) == keras.layers.core.Lambda and layer.name.startswith("block"):
+      # hack for inception resnet add/scale lambda layer
+      ddprint("Add/Scale layer '"+name+"' will not be predefined here")
     elif type(layer) == keras.layers.core.Lambda and layer.name == "space_to_depth_x2":
       swift_obj = ForgeSpaceToDepthX2(layer)
     else:
@@ -1282,7 +1339,7 @@ def addDotNode(layer_name, layer_type, attributes):
   if layer_name in source_obj_of:
     forge_type = source_obj_of[layer_name].forge_class
     shape = source_obj_of[layer_name].layer.output_shape
-    print("shape:", shape)
+    #print("shape:", shape)
     if len(shape) == 4:
       shape = [shape[i] for i in (1,2,3,0)]
     elif len(shape) == 3:
@@ -1355,9 +1412,17 @@ for section in sections:
       if index < len(section.layers)-1:
         line += ", "
     if merge_function != "Concatenate":
-      # Forge merge layers have the same class name as keras layers
       line += '], name: "for_{}")'.format(layer.name)
-      line += ' --> {}(name: "{}")'.format(layer_class,layer.name)
+      
+      if layer_class == "Lambda" and layer.name.startswith("block"):
+        # inception-resnet lambda layer
+        scale = layer.get_config()["arguments"]["scale"]
+        line += ' --> Add(name: "{}") --> Activation('\
+                'MPSCNNNeuronLinear(device: device, a: {}, b: 0), name: "{}")'\
+                .format(layer.name, scale, "scale_"+layer.name)
+      else:
+        # Forge merge layers have the same class name as keras layers
+        line += ' --> {}(name: "{}")'.format(layer_class,layer.name)
       if PLOT_MODELS:
         addDotEdge(collector, layer.name, {"pos":5})
     else:
