@@ -1,12 +1,16 @@
-# Conversion script for tiny-yolo-voc to Metal.
+#!python3
+
+# Conversion script for a number of keras models to Metal.
 #
 # The pretrained YOLOv2 model was made with the Darknet framework. You first
 # need to convert it to a Keras model using YAD2K, and then yolo2metal.py can 
 # convert the Keras model to Metal.
 # 
 # Required packages: python, numpy, h5py, pillow, tensorflow, keras.
+# if you want to plot graphs: dot, graphviz
 #
-# Download the tiny-yolo-voc.weights and tiny-yolo-voc.cfg files:
+#
+# For yolo, download the tiny-yolo-voc.weights and tiny-yolo-voc.cfg files:
 # wget https://pjreddie.com/media/files/tiny-yolo-voc.weights
 # wget https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/tiny-yolo-voc.cfg
 #
@@ -22,6 +26,7 @@
 # and save them to the "Parameters" directory.
 
 import os
+import sys
 import numpy as np
 import keras
 from keras.models import Sequential, load_model
@@ -41,23 +46,55 @@ from PIL import Image
 import imghdr
 
 from keras.preprocessing import image
+import argparse
+
 
 DEBUG_OUT = True
 MORE_DEBUG_OUT = False
 RUN_CLASSIFIER = True
 PLOT_MODELS = True
 SAVE_ORIGINAL_MODEL = True
+EXPORT_ORIGINAL_WEIGHTS = False
 
-PARAMETERS_OUT_DIR = "Parameters2"
-PARAMETERS_ORIG_OUT_DIR = "ParametersOrig2"
+PARAMETERS_OUT_DIR = "Parameters"
+PARAMETERS_ORIG_OUT_DIR = "ParametersOrig"
 
-#MODEL="TINY_YOLO"
-#MODEL="YOLO"
-#as of Aug 29 2017, this official keras inceptions model is still broken with tf backend
-#and gives meaningless predictions
-MODEL="INCEPTION_V3"
-#MODEL="RESNET_50"
-#MODEL="VGG16"
+parser = argparse.ArgumentParser(description='Convert Keras Models to Forge Metal Models',
+                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('model', choices=['TINY_YOLO', 'YOLO', 'INCEPTION_V3', 'RESNET_50','VGG16'])
+parser.add_argument('--param_dir', default="Parameters",
+                  help='Path to directory to write the metal weights for optimized models')
+parser.add_argument('--orig_param_dir', default="OriginalParameters",
+                  help='Path to directory to write the metal weights of non-optimized models')
+parser.add_argument('--model_dir', default='model_data',
+                  help='Path to directory where keras and yolo models are stored')
+parser.add_argument('--image_dir', default='images/classify',
+                  help='Path to directory where images for classification tests are to be found')
+parser.add_argument( '-p', '--plot_models', help='Plot the models and save as image.',
+                action='store_true', default = False)
+parser.add_argument( '-v', '--verbose', help='be verbose about what the converter is doing',
+                action='store_true', default = False)
+parser.add_argument( '-d', '--debug', help='be very verbose about what the converter is doing',
+                action='store_true', default = False)
+parser.add_argument( '-r', '--run_classifier', help='run a classification models on test input',
+                action='store_true', default = False)
+parser.add_argument( '-s', '--save_orig_models', help='save also the non-optimized keras models as .h5',
+                action='store_true', default = False)
+parser.add_argument( '-e', '--export_orig_weigths', help='export also the non-optimized model weigths',
+                action='store_true', default = False)
+
+
+opts = parser.parse_args(sys.argv[1:])
+
+MODEL = opts.model
+DEBUG_OUT = opts.verbose or opts.debug
+MORE_DEBUG_OUT = opts.debug
+PLOT_MODELS= opts.plot_models
+SAVE_ORIGINAL_MODEL=opts.save_orig_models
+RUN_CLASSIFIER=opts.run_classifier
+MODEL_DIR=opts.model_dir
+EXPORT_ORIGINAL_WEIGHTS=opts.export_orig_weigths
+IMAGE_DIR=opts.image_dir
 
 SWAP_INPUT_IMAGE_CHANNELS = False # when true, code for input channel swap RGB->BGR will be generated
 SUBTRACT_IMAGENET_MEAN = False # when true, code for imagenet mean subtraction will be generated
@@ -65,19 +102,19 @@ SCALE_INPUT_TO_MINUS_1_AND_1 = True # when true, the input image values will be 
 
 if MODEL == "YOLO":
   model_name = "yolo"
-  model_path = "model_data/yolo.h5"
+  model_path = MODEL_DIR+"/yolo.h5"
   model = load_model(model_path)
 
 if MODEL == "TINY_YOLO":
   model_name = "tiny_yolo"
-  model_path = "model_data/tiny-yolo-voc.h5"
+  model_path = MODEL_DIR+"/tiny-yolo-voc.h5"
   model = load_model(model_path)
 
 if MODEL=="INCEPTION_V3":
   from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
   SCALE_INPUT_TO_MINUS_1_AND_1 = True
   model_name = "inception_v3"
-  model_path = "model_data/inception_v3.h5"
+  model_path = MODEL_DIR+"/inception_v3.h5"
   model = InceptionV3(weights='imagenet')
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
@@ -87,7 +124,7 @@ if MODEL=="RESNET_50":
   SWAP_INPUT_IMAGE_CHANNELS = True
   SUBTRACT_IMAGENET_MEAN = True
   model_name = "resnet_50"
-  model_path = "model_data/resnet50.h5"
+  model_path = MODEL_DIR+"/resnet50.h5"
   model = ResNet50(weights='imagenet')
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
@@ -97,11 +134,10 @@ if MODEL=="VGG16":
   SWAP_INPUT_IMAGE_CHANNELS = True
   SUBTRACT_IMAGENET_MEAN = True
   model_name = "vgg_16"
-  model_path = "model_data/vgg_16.h5"
+  model_path = MODEL_DIR+"/vgg_16.h5"
   model = VGG16(weights='imagenet')
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
-
 
 def file_name_plus(path_name, name_extension):
   path_file, extension = os.path.splitext(path_name)
@@ -111,7 +147,8 @@ def changed_extension(path_name, new_extension):
   path_file, extension = os.path.splitext(path_name)
   return path_file + new_extension
 
-model.summary()
+if DEBUG_OUT:
+  model.summary()
 
 pydot = None
 
@@ -159,6 +196,7 @@ def ddprint(*args, **kwargs):
   if MORE_DEBUG_OUT:
     print(*args, **kwargs)
 
+# silence output, change to True if you want to have that one, too
 def dddprint(*args, **kwargs):
   if False:
     print(*args, **kwargs)
@@ -198,7 +236,7 @@ def predict_in_dir(models, image_dir):
 if MODEL != "YOLO" and MODEL!="TINY_YOLO":
   #compare_features_fast(features, features_auto)
   if RUN_CLASSIFIER:
-    predict_in_dir([model], "images/classify")
+    predict_in_dir([model], IMAGE_DIR)
 
 ############
 
@@ -268,9 +306,9 @@ def find_inbound_layers(model):
       inbound_node_list = inbound_nodes[0]
       for node in inbound_node_list:
         inbound_names.append(node[0])
-      dprint("Layer name:"+layer_name+": Inbound:"+str(inbound_names))
+      ddprint("Layer name:"+layer_name+": Inbound:"+str(inbound_names))
     else:
-      dprint("Layer name:"+layer_name+": No inbound layers")
+      ddprint("Layer name:"+layer_name+": No inbound layers")
     inbound_layer_by_name[layer_name] = inbound_names
   return inbound_layer_by_name
 
@@ -439,7 +477,8 @@ for index, layer in enumerate(model.layers):
 
 # create our new model using the keras functional API
 new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
-new_model.summary()
+if DEBUG_OUT:
+  new_model.summary()
 if PLOT_MODELS:
   plot_model(new_model, to_file=changed_extension(file_name_plus(model_path,'_new'),'.png'))
 
@@ -449,8 +488,9 @@ ddprint("Replaced layers:"+str(replaced_layer))
 # we have to do it after model instantiation because
 # the keras could not calculate the actual shapes
 # before the model was completely set up
+print("Setting weights for new model")
 for layer_name_, weights in weights_by_name.items():
-  print("Setting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
+  dprint("Setting weights for layer "+layer_name_+" type " + layer_by_name[layer_name_].__class__.__name__)
   #print("weights     :"+str(np.shape(weights)))
   #print("orig_weights:"+str(np.shape(layer_by_name[layer_name_].get_weights())))
   layer_by_name[layer_name_].set_weights(weights)
@@ -472,7 +512,7 @@ def write_np_array(the_array, the_file_path):
 
 def export_layers(the_model, model_name, dst_path):
   if not os.path.exists(dst_path):
-    print('Creating output path {} for weights and biases'.format(dst_path))
+    print('Creating output dir  "{}" for weights and biases'.format(dst_path))
     os.mkdir(dst_path)
    
 
@@ -483,18 +523,18 @@ def export_layers(the_model, model_name, dst_path):
     weights = layer.get_weights()
     if weights and len(weights):
       dprint("Exporting weights for layer "+layer.name+" type " + str(type(layer)))
-      dprint("layer config:" +pretty(layer.get_config())) 
+      ddprint("layer config:" +pretty(layer.get_config())) 
       dprint("Layer '{}' has {} weight arrays".format(layer.name, len(weights)))
     for i, w in enumerate(weights):
       if i % 2 == 0:
         # In "th" format convolutional kernels have the shape (depth, input_depth, rows, cols)
         # In "tf" format convolutional kernels have the shape (rows, cols, input_depth, depth)
         #                              aka shape (height, width, inputChannels, outputChannels)
-        dprint("Keras weights shape:"+str(w.shape))
+        ddprint("Keras weights shape:"+str(w.shape))
         outfile = "{}-{}.weights.bin".format(model_name,layer.name)
         outpath = os.path.join(dst_path, outfile)
         if type(layer) == Conv2D:
-          print("Converting weights to metal for Conv2D layer") 
+          ddprint("Converting weights to metal for Conv2D layer") 
           tw = w
           #if layer.get_config()["data_format"] == "channels_last":
           #elif layer.get_config()["data_format"] == "channels_first":
@@ -502,11 +542,11 @@ def export_layers(the_model, model_name, dst_path):
           #  raise RuntimeError("unknown kernel weight format")
           # metal wants:  weight[ outputChannels ][ kernelHeight ][ kernelWidth ][ inputChannels / groups ]
           tw = w.transpose(3, 0, 1, 2)
-          dprint("Metal conv weights shape:"+str(tw.shape))
+          ddprint("Metal conv weights shape:"+str(tw.shape))
           write_np_array(tw, outpath)
           shape_info[outfile] = tw.shape
         elif type(layer) == Dense:
-          print("Converting weights to metal for Dense layer") 
+          ddprint("Converting weights to metal for Dense layer") 
           # In metal there is no need for a flatten layer when CNN is fed to a dense layer,
           # but the weights must be properly arranges depending on the input layer:
           # The metal dense weights array: The number of entries is =
@@ -517,28 +557,28 @@ def export_layers(the_model, model_name, dst_path):
           # In Metal, the output of the dense layer has width=1 height=1 and channnels=outputchannels
           input_channels =  w.shape[0]
           output_channels = w.shape[1]
-          print("input_channels=",input_channels)
-          print("output_channels=",output_channels)
+          ddprint("input_channels=",input_channels)
+          ddprint("output_channels=",output_channels)
           input_layer = the_model.get_layer(inbounds[layer.name][0])
-          print("input_layer.name",input_layer.name)
+          ddprint("input_layer.name",input_layer.name)
           metal_weights = None
           if type(input_layer) == Flatten:
-            print("Keras model has a Flatten layer, lets get the shape of its input")
+            ddprint("Keras model has a Flatten layer, lets get the shape of its input")
             input_layer = the_model.get_layer(inbounds[input_layer.name][0])
-            print("effective input_layer.name",input_layer.name)
+            ddprint("effective input_layer.name",input_layer.name)
           fc_in_shape = input_layer.output_shape
-          print("fc_in_shape",str(fc_in_shape))
+          ddprint("fc_in_shape",str(fc_in_shape))
           if type(input_layer) != Dense and layer.__class__.__name__ == "Concatenate":
-            print("Keras model input to dense layer is not a Dense or Concatenate layer, so we need to arrange the weigts to its output shape")
+            ddprint("Keras model input to dense layer is not a Dense or Concatenate layer, so we need to arrange the weigts to its output shape")
             conv_outputs = fc_in_shape[3]
             conv_height = fc_in_shape[2]
             output_width = fc_in_shape[1]
             fc_shape = (output_channels, conv_outputs, conv_height, output_width)
-            print("fc_shape",str(fc_shape))
+            ddprint("fc_shape",str(fc_shape))
             rw = w.transpose().reshape(fc_shape)
-            dprint("intermediate weights shape rw:"+str(rw.shape))
+            ddprint("intermediate weights shape rw:"+str(rw.shape))
             rwt = rw.transpose(0, 2, 3, 1)
-            dprint("intermediate weights shape rwt:"+str(rwt.shape))
+            ddprint("intermediate weights shape rwt:"+str(rwt.shape))
             rrwt = rw.reshape(output_channels, input_channels)
             metal_weights = rrwt
             ''' 
@@ -548,21 +588,21 @@ def export_layers(the_model, model_name, dst_path):
             metal_weights = trained_weights.reshape(fc_shape).transpose(0, 2, 3, 1).reshape(channels_out, channels_in)
             '''
           else:
-            print("Keras model input to Dense layer is a another Dense layer")
+            ddprint("Keras model input to Dense layer is a another Dense layer")
             metal_weights = w.transpose()
-          dprint("Metal weights shape:"+str(metal_weights.shape))
+          ddprint("Metal weights shape:"+str(metal_weights.shape))
           write_np_array(metal_weights, outpath)
           shape_info[outfile] = metal_weights.shape
         else:
           # Keras Dense weight have shape (inputs, outputs)
           # Metal Dense weight have shape (outputs, inputs)
           tw = w.transpose()
-          dprint("Saving weights for other layer than Conv2D or Dense, keras shape:"+
+          ddprint("Saving weights for other layer than Conv2D or Dense, keras shape:"+
                  str(w.shape)+", metal shape:"+str(tw.shape))
           write_np_array(tw, outpath)
           shape_info[outfile] = tw.shape
       else:
-        dprint("Biases shape:"+str(w.shape))
+        ddprint("Biases shape:"+str(w.shape))
         outfile = "{}-{}.biases.bin".format(model_name,layer.name)
         outpath = os.path.join(dst_path, outfile)
         write_np_array(w, outpath)
@@ -571,11 +611,16 @@ def export_layers(the_model, model_name, dst_path):
   with open(os.path.join(dst_path, "shapes.json"), "w") as json_file:
     print(pretty(shape_info), file=json_file)
 
+print("Exporting weights for new model to '{}'".format(PARAMETERS_OUT_DIR))
 export_layers(new_model, model_name, PARAMETERS_OUT_DIR)
-export_layers(model, model_name, PARAMETERS_ORIG_OUT_DIR)
+if EXPORT_ORIGINAL_WEIGHTS:
+  print("Exporting weights for original model to '{}'".format(PARAMETERS_ORIG_OUT_DIR))
+  export_layers(model, model_name, PARAMETERS_ORIG_OUT_DIR)
 
 class_of_layer = {}
 layer_with_name = {}
+
+print("Creating swift code for new model")
 
 for layer in new_model.layers:
   class_of_layer[layer.name] = layer.__class__.__name__
@@ -615,8 +660,8 @@ def gather_activations(model):
 
 activations, params_of_activation, activation_of_layer = gather_activations(new_model)
 dprint("activations:"+str(activations))
-dprint("params_of_activation:"+pretty(params_of_activation))
-dprint("activation_of_layer:"+pretty(activation_of_layer))
+ddprint("params_of_activation:"+pretty(params_of_activation))
+ddprint("activation_of_layer:"+pretty(activation_of_layer))
 
 # transforms a dict of lists of inbounds layer names into a
 # dict of lists of outbound destination names
@@ -668,26 +713,26 @@ def collapsed_layers(connections, replacements):
 
 # set up various maps to help with our new metal network topology
 orig_inbound_by_name = find_inbound_layers(new_model)
-dprint("orig_inbound_by_name:"+str(orig_inbound_by_name))
-dprint()
+ddprint("orig_inbound_by_name:"+str(orig_inbound_by_name))
+ddprint()
 
 replaced_layers = replaced_activation_layers(orig_inbound_by_name, new_model)
-dprint("replaced_layers:"+str(replaced_layers))
-dprint()
+ddprint("replaced_layers:"+str(replaced_layers))
+ddprint()
 
 # key-value reversed version of replaced_layers
 original_activation_layer_of = {v:k for k,v in replaced_layers.items()}
-dprint("original_activation_layer_of:"+str(original_activation_layer_of))
+ddprint("original_activation_layer_of:"+str(original_activation_layer_of))
 
 inbound_by_name = collapsed_layers(orig_inbound_by_name, replaced_layers)
-dprint("inbound_by_name:")
-dprint(pretty(inbound_by_name))
-dprint()
+ddprint("inbound_by_name:")
+ddprint(pretty(inbound_by_name))
+ddprint()
 
 outbound_by_name = outbound_layers(inbound_by_name)
-dprint("outbound_by_name:")
-dprint(pretty(outbound_by_name))
-dprint()
+ddprint("outbound_by_name:")
+ddprint(pretty(outbound_by_name))
+ddprint()
 
 class ChainSection(dict):
   def __init__(self, name, layers):
@@ -780,32 +825,32 @@ def consolidate_concats(section_dict, inbound_by_name, outbound_by_name):
   raw_sections = []
   replaced_concat_of_concat = {}
   for section in section_dict.values():
-    dprint("Consolidating section "+section.name)
+    dprint("Consolidating section '{}'".format(section.name))
     if isinstance(section, ConcatSection):
       out_bounds = outbound_by_name[section.name]
       goes_into_other_concat = any(class_of_layer[layer] == "Concatenate" for layer in out_bounds)
       has_concat_inputs = any(class_of_layer[layer] == "Concatenate" for layer in section.layers)
-      dprint("Consolidating section "+section.name,"goes_into_other_concat",goes_into_other_concat,"has_concat_inputs", has_concat_inputs)
+      ddprint("Consolidating section "+section.name,"goes_into_other_concat",goes_into_other_concat,"has_concat_inputs", has_concat_inputs)
       if goes_into_other_concat and has_concat_inputs:
         raise RuntimeError("Can't deal with multi-layered Contcats")
       if not goes_into_other_concat:
         if not has_concat_inputs:
-          dprint("Consolidating section "+section.name," has no concat inputs, just copying")
+          ddprint("Consolidating section "+section.name," has no concat inputs, just copying")
           raw_sections.append(section)
         else:
           # insert all the new inputs
           new_section_inputs = []
           for input_name in section.layers:
-            dprint("Consolidating section "+section.name,", checking input",input_name)
+            ddprint("Consolidating section "+section.name,", checking input",input_name)
             input_layer = layer_with_name[input_name]
             input_class = class_of_layer[input_layer.name]
             if input_class == "Concatenate":
               other_inputs = section_dict[input_name].layers
-              dprint("Consolidating section "+section.name,"extending with ",other_inputs)
+              ddprint("Consolidating section "+section.name,"extending with ",other_inputs)
               new_section_inputs.extend(other_inputs)
               replaced_concat_of_concat[input_name] = section.name
             else:
-              dprint("Consolidating section "+section.name,"appending ",input_name)
+              ddprint("Consolidating section "+section.name,"appending ",input_name)
               new_section_inputs.append(input_name)
           new_section = ConcatSection(section.name, new_section_inputs)
           raw_sections.append(new_section)
@@ -818,15 +863,9 @@ def consolidate_concats(section_dict, inbound_by_name, outbound_by_name):
         section.layer[index] = replaced_concat_of_concat[layer]
   return raw_sections, replaced_concat_of_concat
         
-'''
-raw_sections = []
-for section in section_dict.values():
-  raw_sections.append(section)
-'''
-
 raw_sections, replaced_concat_of_concat = consolidate_concats(section_dict, inbound_by_name, outbound_by_name)
 
-dprint("replaced_concat_of_concat:\n"+pretty(replaced_concat_of_concat))
+ddprint("replaced_concat_of_concat:\n"+pretty(replaced_concat_of_concat))
 dddprint("raw_sections:\n"+pretty(raw_sections))
 
 # returns a list of all sections that will have to be defined
@@ -838,7 +877,7 @@ def defined_sections(sections):
   return result 
 
 defined = defined_sections(raw_sections)
-dprint("defined = "+str(defined))
+ddprint("defined = "+str(defined))
 
 # return a dict containing a list of names that are referenced
 # by a each section; the third item in the section "head"
@@ -909,8 +948,8 @@ referencing = referencing_sections(raw_sections)
 #print(json.dumps(referencing ,sort_keys=False, indent=4))
 
 sections = sort_sections(raw_sections)
-dprint("Sections ordered properly by referencing:")
-dprint(pretty(sections))
+ddprint("Sections ordered properly by referencing:")
+ddprint(pretty(sections))
 
 # stub for keras -> metal activation function translation
 def translated_activation(activation):
@@ -968,12 +1007,12 @@ class ForgeLayer():
     self.forge_class = forge_class
     self.params = params
   def swift_source(self):
-    dprint(str(self.params))
+    ddprint(str(self.params))
     line = "let {} = {}(".format(self.name, self.forge_class)
     i = 1
     for swift_param in self.params:
       origin = self.params[swift_param]
-      dprint("swift_param:'"+swift_param+"', origin:'"+str(origin)+"'")
+      ddprint("swift_param:'"+swift_param+"', origin:'"+str(origin)+"'")
       cfg_name = origin[0] # name of the keras config item
       # third argument is a precomputed value if first argument is ""
       # or a conversion function if present
@@ -991,7 +1030,7 @@ class ForgeLayer():
         line += arg 
         i += 1
     line += ")"
-    dprint(line)
+    ddprint(line)
     return [line]    
 
 # Generate Forge layer "Convolution":
@@ -1140,7 +1179,7 @@ class ForgeInput(ForgeLayer):
       # "let {} = input --> Resize(width: {}, height: {}) --> Activation(input_scale)"
       line += " --> Activation(input_scale)"
     src.append(line)
-    dprint(src)
+    ddprint(src)
     input_already_defined = True
     return src
    
@@ -1180,19 +1219,16 @@ for activation in activations:
 if SCALE_INPUT_TO_MINUS_1_AND_1:
   swift_src.append("let input_scale = MPSCNNNeuronLinear(device: device, a: 2, b: -1)")
 
-#inbound_layers = orig_input_layers(inbounds, new_model)
-
 source_obj_of = {}
 
 for index, layer in enumerate(new_model.layers):
   name = layer.name
  
-  dprint(str(index)+":"+layer.__class__.__name__+" name:"+name)
-  dprint(str(index)+"type::"+str(type(layer)))
+  dprint(str(index)+":" +layer.__class__.__name__+" name:"+name)
+  dddprint(str(index)+"type::"+str(type(layer)))
   
-
   if layer.name in replaced_layers.keys():
-    dprint("Layer '"+name+"' has been replaced by activation in layer '"+replaced_layers[name])
+    ddprint("Layer '"+name+"' has been replaced by activation in layer '"+replaced_layers[name])
   else:
     swift_obj = None
     if type(layer) == Conv2D:
@@ -1211,10 +1247,10 @@ for index, layer in enumerate(new_model.layers):
       swift_obj = ForgeDense(layer, var_name_of_activation)
     elif type(layer) in [Add, Multiply, Average, Maximum, Flatten]:
       source_obj_of[layer.name] = ForgeLayer(layer, layer.__class__.__name__, {})
-      dprint(str(type(layer))+" layer '"+name+"' will not be predefined here")
+      ddprint(str(type(layer))+" layer '"+name+"' will not be predefined here")
     elif layer.__class__.__name__ == "Concatenate":
       source_obj_of[layer.name] = ForgeLayer(layer, "Concatenate", {})
-      dprint("Concatenate layer '"+name+"' will not be predefined here")
+      ddprint("Concatenate layer '"+name+"' will not be predefined here")
     elif type(layer) == Activation:
       swift_obj = ForgeActivation(layer, var_name_of_activation)
     elif type(layer) == keras.layers.core.Lambda and layer.name == "space_to_depth_x2":
@@ -1389,8 +1425,8 @@ image_data = np.random.random(test_shape).astype('float32')
 features = model.predict(image_data)
 features_auto = new_model.predict(image_data)
 
-print("features.shape:"+str(features.shape))
-print("features_auto.shape:"+str(features_auto.shape))
+ddprint("features.shape:"+str(features.shape))
+ddprint("features_auto.shape:"+str(features_auto.shape))
 
 def compare_features_fast(features1, features2):
   error = np.abs(features1 - features2)
@@ -1402,9 +1438,9 @@ def compare_features_fast(features1, features2):
   max_2 = np.max(features2)
   avrg_1 = np.sum(features1)/features1.size
   avrg_2 = np.sum(features2)/features2.size
-  print("error max:",max_error,"avrg:",avrg_error)
-  print("avrg1:",avrg_1,"min1:",min_1,"max1:", max_1)
-  print("avrg2:",avrg_2,"min2:",min_2,"max2:",max_2)
+  print("Features original : avrg1:",avrg_1,"min1:",min_1,"max1:", max_1)
+  print("Features new model: avrg2:",avrg_2,"min2:",min_2,"max2:",max_2)
+  print("Error max:",max_error,"avrg:",avrg_error)
 
 def compare_features_yolo(features1, features2):
   max_error = 0
@@ -1420,139 +1456,9 @@ def compare_features_yolo(features1, features2):
 if MODEL != "YOLO" and MODEL!="TINY_YOLO":
   compare_features_fast(features, features_auto)
   if RUN_CLASSIFIER:
-    predict_in_dir([model, new_model], "images/classify")
+    predict_in_dir([model, new_model], IMAGE_DIR)
 else:
   compare_features_yolo(features, features_auto)
 
-
 print("Done!")
-
-'''
-tiny-yolo-voc
-
-Layer (type)                 Output Shape              Param #   
-=================================================================
-input_1 (InputLayer)         (None, 416, 416, 3)       0         
-conv2d_1 (Conv2D)            (None, 416, 416, 16)      432       
-batch_normalization_1 (Batch (None, 416, 416, 16)      64        
-leaky_re_lu_1 (LeakyReLU)    (None, 416, 416, 16)      0         
-max_pooling2d_1 (MaxPooling2 (None, 208, 208, 16)      0         
-conv2d_2 (Conv2D)            (None, 208, 208, 32)      4608      
-batch_normalization_2 (Batch (None, 208, 208, 32)      128       
-leaky_re_lu_2 (LeakyReLU)    (None, 208, 208, 32)      0         
-max_pooling2d_2 (MaxPooling2 (None, 104, 104, 32)      0         
-conv2d_3 (Conv2D)            (None, 104, 104, 64)      18432     
-batch_normalization_3 (Batch (None, 104, 104, 64)      256       
-leaky_re_lu_3 (LeakyReLU)    (None, 104, 104, 64)      0         
-max_pooling2d_3 (MaxPooling2 (None, 52, 52, 64)        0         
-conv2d_4 (Conv2D)            (None, 52, 52, 128)       73728     
-batch_normalization_4 (Batch (None, 52, 52, 128)       512       
-leaky_re_lu_4 (LeakyReLU)    (None, 52, 52, 128)       0         
-max_pooling2d_4 (MaxPooling2 (None, 26, 26, 128)       0         
-conv2d_5 (Conv2D)            (None, 26, 26, 256)       294912    
-batch_normalization_5 (Batch (None, 26, 26, 256)       1024      
-leaky_re_lu_5 (LeakyReLU)    (None, 26, 26, 256)       0         
-max_pooling2d_5 (MaxPooling2 (None, 13, 13, 256)       0         
-conv2d_6 (Conv2D)            (None, 13, 13, 512)       1179648   
-batch_normalization_6 (Batch (None, 13, 13, 512)       2048      
-leaky_re_lu_6 (LeakyReLU)    (None, 13, 13, 512)       0         
-max_pooling2d_6 (MaxPooling2 (None, 13, 13, 512)       0         
-conv2d_7 (Conv2D)            (None, 13, 13, 1024)      4718592   
-batch_normalization_7 (Batch (None, 13, 13, 1024)      4096      
-leaky_re_lu_7 (LeakyReLU)    (None, 13, 13, 1024)      0         
-conv2d_8 (Conv2D)            (None, 13, 13, 1024)      9437184   
-batch_normalization_8 (Batch (None, 13, 13, 1024)      4096      
-leaky_re_lu_8 (LeakyReLU)    (None, 13, 13, 1024)      0         
-conv2d_9 (Conv2D)            (None, 13, 13, 125)       128125    
-=================================================================
-Total params: 15,867,885
-Trainable params: 15,861,773
-Non-trainable params: 6,112
-
-____________________________________________________________________________________________________
-Layer (type)                     Output Shape          Param #     Connected to                     
-====================================================================================================
-input_1 (InputLayer)             (None, 608, 608, 3)   0                                            
-conv2d_1 (Conv2D)                (None, 608, 608, 32)  864         input_1[0][0]                    
-batch_normalization_1 (BatchNorm (None, 608, 608, 32)  128         conv2d_1[0][0]                   
-leaky_re_lu_1 (LeakyReLU)        (None, 608, 608, 32)  0           batch_normalization_1[0][0]      
-max_pooling2d_1 (MaxPooling2D)   (None, 304, 304, 32)  0           leaky_re_lu_1[0][0]              
-conv2d_2 (Conv2D)                (None, 304, 304, 64)  18432       max_pooling2d_1[0][0]            
-batch_normalization_2 (BatchNorm (None, 304, 304, 64)  256         conv2d_2[0][0]                   
-leaky_re_lu_2 (LeakyReLU)        (None, 304, 304, 64)  0           batch_normalization_2[0][0]      
-max_pooling2d_2 (MaxPooling2D)   (None, 152, 152, 64)  0           leaky_re_lu_2[0][0]              
-conv2d_3 (Conv2D)                (None, 152, 152, 128) 73728       max_pooling2d_2[0][0]            
-batch_normalization_3 (BatchNorm (None, 152, 152, 128) 512         conv2d_3[0][0]                   
-leaky_re_lu_3 (LeakyReLU)        (None, 152, 152, 128) 0           batch_normalization_3[0][0]      
-conv2d_4 (Conv2D)                (None, 152, 152, 64)  8192        leaky_re_lu_3[0][0]              
-batch_normalization_4 (BatchNorm (None, 152, 152, 64)  256         conv2d_4[0][0]                   
-leaky_re_lu_4 (LeakyReLU)        (None, 152, 152, 64)  0           batch_normalization_4[0][0]      
-conv2d_5 (Conv2D)                (None, 152, 152, 128) 73728       leaky_re_lu_4[0][0]              
-batch_normalization_5 (BatchNorm (None, 152, 152, 128) 512         conv2d_5[0][0]                   
-leaky_re_lu_5 (LeakyReLU)        (None, 152, 152, 128) 0           batch_normalization_5[0][0]      
-max_pooling2d_3 (MaxPooling2D)   (None, 76, 76, 128)   0           leaky_re_lu_5[0][0]              
-conv2d_6 (Conv2D)                (None, 76, 76, 256)   294912      max_pooling2d_3[0][0]            
-batch_normalization_6 (BatchNorm (None, 76, 76, 256)   1024        conv2d_6[0][0]                   
-leaky_re_lu_6 (LeakyReLU)        (None, 76, 76, 256)   0           batch_normalization_6[0][0]      
-conv2d_7 (Conv2D)                (None, 76, 76, 128)   32768       leaky_re_lu_6[0][0]              
-batch_normalization_7 (BatchNorm (None, 76, 76, 128)   512         conv2d_7[0][0]                   
-leaky_re_lu_7 (LeakyReLU)        (None, 76, 76, 128)   0           batch_normalization_7[0][0]      
-conv2d_8 (Conv2D)                (None, 76, 76, 256)   294912      leaky_re_lu_7[0][0]              
-batch_normalization_8 (BatchNorm (None, 76, 76, 256)   1024        conv2d_8[0][0]                   
-leaky_re_lu_8 (LeakyReLU)        (None, 76, 76, 256)   0           batch_normalization_8[0][0]      
-max_pooling2d_4 (MaxPooling2D)   (None, 38, 38, 256)   0           leaky_re_lu_8[0][0]              
-conv2d_9 (Conv2D)                (None, 38, 38, 512)   1179648     max_pooling2d_4[0][0]            
-batch_normalization_9 (BatchNorm (None, 38, 38, 512)   2048        conv2d_9[0][0]                   
-leaky_re_lu_9 (LeakyReLU)        (None, 38, 38, 512)   0           batch_normalization_9[0][0]      
-conv2d_10 (Conv2D)               (None, 38, 38, 256)   131072      leaky_re_lu_9[0][0]              
-batch_normalization_10 (BatchNor (None, 38, 38, 256)   1024        conv2d_10[0][0]                  
-leaky_re_lu_10 (LeakyReLU)       (None, 38, 38, 256)   0           batch_normalization_10[0][0]     
-conv2d_11 (Conv2D)               (None, 38, 38, 512)   1179648     leaky_re_lu_10[0][0]             
-batch_normalization_11 (BatchNor (None, 38, 38, 512)   2048        conv2d_11[0][0]                  
-leaky_re_lu_11 (LeakyReLU)       (None, 38, 38, 512)   0           batch_normalization_11[0][0]     
-conv2d_12 (Conv2D)               (None, 38, 38, 256)   131072      leaky_re_lu_11[0][0]             
-batch_normalization_12 (BatchNor (None, 38, 38, 256)   1024        conv2d_12[0][0]                  
-leaky_re_lu_12 (LeakyReLU)       (None, 38, 38, 256)   0           batch_normalization_12[0][0]     
-conv2d_13 (Conv2D)               (None, 38, 38, 512)   1179648     leaky_re_lu_12[0][0]             
-batch_normalization_13 (BatchNor (None, 38, 38, 512)   2048        conv2d_13[0][0]                  
-leaky_re_lu_13 (LeakyReLU)       (None, 38, 38, 512)   0           batch_normalization_13[0][0]     
-max_pooling2d_5 (MaxPooling2D)   (None, 19, 19, 512)   0           leaky_re_lu_13[0][0]             
-conv2d_14 (Conv2D)               (None, 19, 19, 1024)  4718592     max_pooling2d_5[0][0]            
-batch_normalization_14 (BatchNor (None, 19, 19, 1024)  4096        conv2d_14[0][0]                  
-leaky_re_lu_14 (LeakyReLU)       (None, 19, 19, 1024)  0           batch_normalization_14[0][0]     
-conv2d_15 (Conv2D)               (None, 19, 19, 512)   524288      leaky_re_lu_14[0][0]             
-batch_normalization_15 (BatchNor (None, 19, 19, 512)   2048        conv2d_15[0][0]                  
-leaky_re_lu_15 (LeakyReLU)       (None, 19, 19, 512)   0           batch_normalization_15[0][0]     
-conv2d_16 (Conv2D)               (None, 19, 19, 1024)  4718592     leaky_re_lu_15[0][0]             
-batch_normalization_16 (BatchNor (None, 19, 19, 1024)  4096        conv2d_16[0][0]                  
-leaky_re_lu_16 (LeakyReLU)       (None, 19, 19, 1024)  0           batch_normalization_16[0][0]     
-conv2d_17 (Conv2D)               (None, 19, 19, 512)   524288      leaky_re_lu_16[0][0]             
-batch_normalization_17 (BatchNor (None, 19, 19, 512)   2048        conv2d_17[0][0]                  
-leaky_re_lu_17 (LeakyReLU)       (None, 19, 19, 512)   0           batch_normalization_17[0][0]     
-conv2d_18 (Conv2D)               (None, 19, 19, 1024)  4718592     leaky_re_lu_17[0][0]             
-batch_normalization_18 (BatchNor (None, 19, 19, 1024)  4096        conv2d_18[0][0]                  
-leaky_re_lu_18 (LeakyReLU)       (None, 19, 19, 1024)  0           batch_normalization_18[0][0]     
-conv2d_19 (Conv2D)               (None, 19, 19, 1024)  9437184     leaky_re_lu_18[0][0]             
-batch_normalization_19 (BatchNor (None, 19, 19, 1024)  4096        conv2d_19[0][0]                  
-conv2d_21 (Conv2D)               (None, 38, 38, 64)    32768       leaky_re_lu_13[0][0]             
-leaky_re_lu_19 (LeakyReLU)       (None, 19, 19, 1024)  0           batch_normalization_19[0][0]     
-batch_normalization_21 (BatchNor (None, 38, 38, 64)    256         conv2d_21[0][0]                  
-conv2d_20 (Conv2D)               (None, 19, 19, 1024)  9437184     leaky_re_lu_19[0][0]             
-leaky_re_lu_21 (LeakyReLU)       (None, 38, 38, 64)    0           batch_normalization_21[0][0]     
-batch_normalization_20 (BatchNor (None, 19, 19, 1024)  4096        conv2d_20[0][0]                  
-space_to_depth_x2 (Lambda)       (None, 19, 19, 256)   0           leaky_re_lu_21[0][0]             
-leaky_re_lu_20 (LeakyReLU)       (None, 19, 19, 1024)  0           batch_normalization_20[0][0]     
-concatenate_1 (Concatenate)      (None, 19, 19, 1280)  0           space_to_depth_x2[0][0]          
-                                                                   leaky_re_lu_20[0][0]             
-conv2d_22 (Conv2D)               (None, 19, 19, 1024)  11796480    concatenate_1[0][0]              
-batch_normalization_22 (BatchNor (None, 19, 19, 1024)  4096        conv2d_22[0][0]                  
-leaky_re_lu_22 (LeakyReLU)       (None, 19, 19, 1024)  0           batch_normalization_22[0][0]     
-conv2d_23 (Conv2D)               (None, 19, 19, 425)   435625      leaky_re_lu_22[0][0]             
-====================================================================================================
-Total params: 50,983,561
-Trainable params: 50,962,889
-Non-trainable params: 20,672
-____________________________________________________________________________________________________
-'''
-
 
