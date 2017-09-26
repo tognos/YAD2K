@@ -59,8 +59,9 @@ MODEL="INCEPTION_V3"
 #MODEL="RESNET_50"
 #MODEL="VGG16"
 
-CAFFE_MODEL = False # when true, code for input channel swap RGB->BGR will be generated
-IMAGENET_MODEL = False # when true, code for imagenet mean subtraction will be generated
+SWAP_INPUT_IMAGE_CHANNELS = False # when true, code for input channel swap RGB->BGR will be generated
+SUBTRACT_IMAGENET_MEAN = False # when true, code for imagenet mean subtraction will be generated
+SCALE_INPUT_TO_MINUS_1_AND_1 = True # when true, the input image values will be scaled to -1 .. 1
 
 if MODEL == "YOLO":
   model_name = "yolo"
@@ -74,8 +75,7 @@ if MODEL == "TINY_YOLO":
 
 if MODEL=="INCEPTION_V3":
   from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
-  CAFFE_MODEL = True
-  IMAGENET_MODEL = True
+  SCALE_INPUT_TO_MINUS_1_AND_1 = True
   model_name = "inception_v3"
   model_path = "model_data/inception_v3.h5"
   model = InceptionV3(weights='imagenet')
@@ -84,8 +84,8 @@ if MODEL=="INCEPTION_V3":
 
 if MODEL=="RESNET_50":
   from keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
-  CAFFE_MODEL = True
-  IMAGENET_MODEL = True
+  SWAP_INPUT_IMAGE_CHANNELS = True
+  SUBTRACT_IMAGENET_MEAN = True
   model_name = "resnet_50"
   model_path = "model_data/resnet50.h5"
   model = ResNet50(weights='imagenet')
@@ -94,8 +94,8 @@ if MODEL=="RESNET_50":
 
 if MODEL=="VGG16":
   from keras.applications.vgg16 import VGG16, preprocess_input, decode_predictions
-  CAFFE_MODEL = True
-  IMAGENET_MODEL = True
+  SWAP_INPUT_IMAGE_CHANNELS = True
+  SUBTRACT_IMAGENET_MEAN = True
   model_name = "vgg_16"
   model_path = "model_data/vgg_16.h5"
   model = VGG16(weights='imagenet')
@@ -489,6 +489,7 @@ def export_layers(the_model, model_name, dst_path):
       if i % 2 == 0:
         # In "th" format convolutional kernels have the shape (depth, input_depth, rows, cols)
         # In "tf" format convolutional kernels have the shape (rows, cols, input_depth, depth)
+        #                              aka shape (height, width, inputChannels, outputChannels)
         dprint("Keras weights shape:"+str(w.shape))
         outfile = "{}-{}.weights.bin".format(model_name,layer.name)
         outpath = os.path.join(dst_path, outfile)
@@ -499,6 +500,7 @@ def export_layers(the_model, model_name, dst_path):
           #elif layer.get_config()["data_format"] == "channels_first":
           #else:
           #  raise RuntimeError("unknown kernel weight format")
+          # metal wants:  weight[ outputChannels ][ kernelHeight ][ kernelWidth ][ inputChannels / groups ]
           tw = w.transpose(3, 0, 1, 2)
           dprint("Metal conv weights shape:"+str(tw.shape))
           write_np_array(tw, outpath)
@@ -772,11 +774,60 @@ section_dict = {}
 chain_layers(input_layers[0], inbound_by_name, outbound_by_name, section_dict,[])
 dddprint(pretty(section_dict))
 
+# walk through all section and replace inputs of concat layers that have another
+# concat layer as input with the inputs of this layer
+def consolidate_concats(section_dict, inbound_by_name, outbound_by_name):
+  raw_sections = []
+  replaced_concat_of_concat = {}
+  for section in section_dict.values():
+    dprint("Consolidating section "+section.name)
+    if isinstance(section, ConcatSection):
+      out_bounds = outbound_by_name[section.name]
+      goes_into_other_concat = any(class_of_layer[layer] == "Concatenate" for layer in out_bounds)
+      has_concat_inputs = any(class_of_layer[layer] == "Concatenate" for layer in section.layers)
+      dprint("Consolidating section "+section.name,"goes_into_other_concat",goes_into_other_concat,"has_concat_inputs", has_concat_inputs)
+      if goes_into_other_concat and has_concat_inputs:
+        raise RuntimeError("Can't deal with multi-layered Contcats")
+      if not goes_into_other_concat:
+        if not has_concat_inputs:
+          dprint("Consolidating section "+section.name," has no concat inputs, just copying")
+          raw_sections.append(section)
+        else:
+          # insert all the new inputs
+          new_section_inputs = []
+          for input_name in section.layers:
+            dprint("Consolidating section "+section.name,", checking input",input_name)
+            input_layer = layer_with_name[input_name]
+            input_class = class_of_layer[input_layer.name]
+            if input_class == "Concatenate":
+              other_inputs = section_dict[input_name].layers
+              dprint("Consolidating section "+section.name,"extending with ",other_inputs)
+              new_section_inputs.extend(other_inputs)
+              replaced_concat_of_concat[input_name] = section.name
+            else:
+              dprint("Consolidating section "+section.name,"appending ",input_name)
+              new_section_inputs.append(input_name)
+          new_section = ConcatSection(section.name, new_section_inputs)
+          raw_sections.append(new_section)
+    else:
+      raw_sections.append(section)
+  # replace all the names of concats that no longer exist with the new names
+  for section in raw_sections:
+    for index, layer in enumerate(section.layers):
+      if layer in replaced_concat_of_concat:
+        section.layer[index] = replaced_concat_of_concat[layer]
+  return raw_sections, replaced_concat_of_concat
+        
+'''
 raw_sections = []
 for section in section_dict.values():
   raw_sections.append(section)
+'''
 
-dddprint(pretty(raw_sections))
+raw_sections, replaced_concat_of_concat = consolidate_concats(section_dict, inbound_by_name, outbound_by_name)
+
+dprint("replaced_concat_of_concat:\n"+pretty(replaced_concat_of_concat))
+dddprint("raw_sections:\n"+pretty(raw_sections))
 
 # returns a list of all sections that will have to be defined
 # as referenceable constants
@@ -890,6 +941,9 @@ def to_swift_enum(enum):
   else:
     raise RuntimeError("Can't convert keras enum:"+enum)
 
+def swap_2_coords(array2):
+  return (array2[1], array2[0])
+
 def index_0(value):
   return value[0]
 def index_1(value):
@@ -953,7 +1007,7 @@ class ForgeLayer():
 class ForgeConv2D(ForgeLayer):
   def __init__(self, layer, var_name_of_activation):
     params = OrderedDict([ 
-      ("kernel"    , ("kernel_size",)),
+      ("kernel"    , ("kernel_size","",swap_2_coords)),
       ("channels"  , ("filters",)),
       ("stride"    , ("strides", (1, 1))),
       ("padding"   , ("padding", ".same", to_swift_enum)),
@@ -1064,25 +1118,25 @@ class ForgeInput(ForgeLayer):
       raise RuntimeError("Forge supports only one input but network has multiple inputs")
     src = []
     src.append("let input = Input()")
-    if CAFFE_MODEL:
+    if SWAP_INPUT_IMAGE_CHANNELS:
       src.append('let swap_channels = Custom(TransposeChannelsKernel('
                  'device: device, featureChannels: 3, permute: [2,1,0]), name: "rgb2bgr")')
 
-    if IMAGENET_MODEL:
+    if SUBTRACT_IMAGENET_MEAN:
       src.append('let subtract_mean = Custom(SubtractMeanColor('
-        'device:device, red: 123.68, green: 116.779, blue: 103.939, scale: 255.0), '
+        'device: device, red: 123.68, green: 116.779, blue: 103.939, scale: 255.0), '
         'name: "subtract_mean")')
 
     # "let {} = input --> Resize(width: {}, height: {})"
     line = super().swift_source()[0].replace("Input", "input --> Resize")
-    if CAFFE_MODEL:
+    if SWAP_INPUT_IMAGE_CHANNELS:
       line += " -->  swap_channels"
-    if IMAGENET_MODEL:
+    if SUBTRACT_IMAGENET_MEAN:
       line += " -->  subtract_mean"
     
     # inception V3 wants input scaled between -1 and 1, but we can not
     # know that from the model; there is nothing about that in the input config
-    if MODEL == "INCEPTION_V3":
+    if SCALE_INPUT_TO_MINUS_1_AND_1:
       # "let {} = input --> Resize(width: {}, height: {}) --> Activation(input_scale)"
       line += " --> Activation(input_scale)"
     src.append(line)
@@ -1123,7 +1177,7 @@ for activation in activations:
 
 # inception V3 wants input scaled between -1 and 1, but we can not
 # know that from the model; there is nothing about that in the input config
-if MODEL == "INCEPTION_V3":
+if SCALE_INPUT_TO_MINUS_1_AND_1:
   swift_src.append("let input_scale = MPSCNNNeuronLinear(device: device, a: 2, b: -1)")
 
 #inbound_layers = orig_input_layers(inbounds, new_model)
