@@ -1,4 +1,4 @@
-#!python3
+#!/usr/bin/env python3
 
 # Conversion script for a number of keras models to Metal.
 #
@@ -25,8 +25,11 @@
 # Finally, run yolo2metal.py. It will convert the weights to Metal format
 # and save them to the "Parameters" directory.
 
+print("*** keras2metal converter v0.1 ***")
+
 import os
 import sys
+import datetime
 import numpy as np
 import keras
 from keras.models import Sequential, load_model
@@ -48,9 +51,9 @@ import imghdr
 from keras.preprocessing import image
 import argparse
 
-
-DEBUG_OUT = True
-MORE_DEBUG_OUT = False
+'''
+VERBOSE = True
+MORE_VERBOSE = False
 RUN_CLASSIFIER = True
 PLOT_MODELS = True
 SAVE_ORIGINAL_MODEL = True
@@ -58,6 +61,7 @@ EXPORT_ORIGINAL_WEIGHTS = False
 
 PARAMETERS_OUT_DIR = "Parameters"
 PARAMETERS_ORIG_OUT_DIR = "ParametersOrig"
+'''
 
 parser = argparse.ArgumentParser(description='Convert Keras Models to Forge Metal Models',
                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -69,6 +73,8 @@ parser.add_argument('--orig_param_dir', default="OriginalParameters",
                   help='Path to directory to write the metal weights of non-optimized models')
 parser.add_argument('--model_dir', default='model_data',
                   help='Path to directory where keras and yolo models are stored')
+parser.add_argument('--src_out_dir', default='generated_src',
+                  help='Path to directory where the swift source code will be written')
 parser.add_argument('--image_dir', default='images/classify',
                   help='Path to directory where images for classification tests are to be found')
 parser.add_argument( '-p', '--plot_models', help='Plot the models and save as image.',
@@ -91,8 +97,8 @@ parser.add_argument( '-q', '--quick_run', help='skip optimzed model generation a
 opts = parser.parse_args(sys.argv[1:])
 
 MODEL = opts.model
-DEBUG_OUT = opts.verbose or opts.debug
-MORE_DEBUG_OUT = opts.debug
+VERBOSE = opts.verbose or opts.debug
+MORE_VERBOSE = opts.debug
 PLOT_MODELS= opts.plot_models
 SAVE_ORIGINAL_MODEL=opts.save_orig_models
 RUN_CLASSIFIER=opts.run_classifier
@@ -100,6 +106,16 @@ MODEL_DIR=opts.model_dir
 EXPORT_ORIGINAL_WEIGHTS=opts.export_orig_weigths
 IMAGE_DIR=opts.image_dir
 QUICK_RUN=opts.quick_run
+SRC_OUT_DIR=opts.src_out_dir
+PARAMETERS_OUT_DIR=opts.param_dir
+PARAMETERS_ORIG_OUT_DIR=opts.orig_param_dir
+
+print(opts)
+
+if RUN_CLASSIFIER:
+  if MODEL == "YOLO" or MODEL == "TINY_YOLO":
+    print("WARNINNG: classifier will not be run on YOLO; use test_yolo.py instead")
+    RUN_CLASSIFIER = False
 
 SWAP_INPUT_IMAGE_CHANNELS = False # when true, code for input channel swap RGB->BGR will be generated
 SUBTRACT_IMAGENET_MEAN = False # when true, code for imagenet mean subtraction will be generated
@@ -162,7 +178,7 @@ def changed_extension(path_name, new_extension):
   path_file, extension = os.path.splitext(path_name)
   return path_file + new_extension
 
-if DEBUG_OUT:
+if VERBOSE:
   model.summary()
 
 pydot = None
@@ -172,13 +188,15 @@ def import_pydot():
     # pydot-ng is a fork of pydot that is better maintained.
     import pydot_ng as pydot
   except ImportError:
-    print("Failed to import pydot_ng, falling back on pydotplus")
+    if MORE_VERBOSE:
+      print("Failed to import pydot_ng, falling back on pydotplus")
     # pydotplus is an improved version of pydot
     try:
       import pydotplus as pydot
     except ImportError:
       # Fall back on pydot if necessary.
-      print("Failed to import pydotplus, falling back on pydot")
+      if MORE_VERBOSE:
+        print("Failed to import pydotplus, falling back on pydot")
       try:
         import pydot
       except ImportError:
@@ -204,11 +222,11 @@ if PLOT_MODELS:
   plot_model(model, to_file=changed_extension(model_path,'.png'))
 
 def dprint(*args, **kwargs):
-  if DEBUG_OUT:
+  if VERBOSE:
     print(*args, **kwargs)
 
 def ddprint(*args, **kwargs):
-  if MORE_DEBUG_OUT:
+  if MORE_VERBOSE:
     print(*args, **kwargs)
 
 # silence output, change to True if you want to have that one, too
@@ -218,13 +236,22 @@ def dddprint(*args, **kwargs):
 
 
 #############
+def top_classes(preds, top=5):
+  results = []
+  confidences = []
+  for pred in preds:
+    top_indices = pred.argsort()[-top:][::-1]
+    top_preds = [pred[i] for i in top_indices]
+    results.append(top_indices)
+    confidences.append(top_preds)
+  return results, confidences
 
 def predict_image(model, img_path):
   batch_input_shape = model.layers[0].get_config()['batch_input_shape']
   input_shape = batch_input_shape[1:3]
   if input_shape[0] == None or input_shape[1] == None:
     input_shape = (299,299)
-  dprint("Loading "+img_path)
+  print("\nLoading "+img_path)
   img = image.load_img(img_path, target_size=input_shape)
   x = image.img_to_array(img)
   x = np.expand_dims(x, axis=0)
@@ -235,7 +262,10 @@ def predict_image(model, img_path):
 
   # decode the results into a list of tuples (class, description, probability)
   # (one such list for each sample in the batch)
-  dprint('Predicted:', decode_predictions(preds, top=3)[0])
+  print('Predicted:', decode_predictions(preds, top=5)[0])
+  top_i, top_p = top_classes(preds, top=5)
+  print('Top5 Classes:', top_i[0])
+  print('Top5 Confid.:', top_p[0])
   return preds
 
 def predict_in_dir(models, image_dir):
@@ -249,10 +279,8 @@ def predict_in_dir(models, image_dir):
     for model in models:
       predict_image(model, os.path.join(image_dir, image_file))
 
-if MODEL != "YOLO" and MODEL!="TINY_YOLO":
-  #compare_features_fast(features, features_auto)
-  if RUN_CLASSIFIER:
-    predict_in_dir([model], IMAGE_DIR)
+if RUN_CLASSIFIER:
+  predict_in_dir([model], IMAGE_DIR)
 
 ############
 
@@ -303,7 +331,6 @@ prev_layer = None
 prev_prev_layer = None
 new_weights = []
 
-print("Creating optimized model (with batchnorm folding):\n")
 
 # returns a dict mapping all layer names to arrays with the names of their inbound layers
 # layers with no inbound layers map to an empty array
@@ -420,6 +447,7 @@ def register_new_layer(the_name, the_layer, the_output):
   output_by_name[the_name] = the_output
 
 if not QUICK_RUN:
+  print("Creating optimized model (with batchnorm folding):\n")
   # iterate over all layers of the original model
   for index, layer in enumerate(model.layers):
     #print("\n"+str(index)+":"+layer.__class__.__name__+":"+str(layer.get_config()))
@@ -506,9 +534,10 @@ if not QUICK_RUN:
   # create our new model using the keras functional API
   new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
 else:
+  print("Loading optimized model (with batchnorm folding)\n")
   new_model = load_model(file_name_plus(model_path, "_nobn"))
 
-if DEBUG_OUT:
+if VERBOSE:
   new_model.summary()
 if PLOT_MODELS:
   plot_model(new_model, to_file=changed_extension(file_name_plus(model_path,'_new'),'.png'))
@@ -863,7 +892,7 @@ def consolidate_concats(section_dict, inbound_by_name, outbound_by_name):
   raw_sections = []
   replaced_concat_of_concat = {}
   for section in section_dict.values():
-    dprint("Consolidating section '{}'".format(section.name))
+    ddprint("Consolidating section '{}'".format(section.name))
     if isinstance(section, ConcatSection) and class_of_layer[section.name] == "Concatenate":
       out_bounds = outbound_by_name[section.name]
       goes_into_other_concat = any(class_of_layer[layer] == "Concatenate" for layer in out_bounds)
@@ -1039,12 +1068,27 @@ def swap_2_coords(array2):
 
 def index_0(value):
   return value[0]
+
 def index_1(value):
   return value[1]
+
 def index_2(value):
   return value[2]
+
 def index_3(value):
   return value[3]
+
+# hack for resnet with undefined input shape
+def index_1_or_299(value):
+  if value[1] != None:
+    return value[1]
+  return 299
+
+def index_2_or_299(value):
+  if value[2] != None:
+    return value[2]
+  return 299
+
 
 def quote_string(name):
   return '"{}"'.format(name)
@@ -1199,8 +1243,8 @@ input_already_defined = False
 class ForgeInput(ForgeLayer):
   def __init__(self, layer):
     params = OrderedDict([ 
-      ("width" , ("batch_input_shape", None, index_1)),
-      ("height" ,("batch_input_shape", None, index_2))
+      ("width" , ("batch_input_shape", None, index_1_or_299)),
+      ("height" ,("batch_input_shape", None, index_2_or_299))
       #("name"    , ("name","",quote_string))
     ])
     super().__init__(layer, "Input", params)
@@ -1240,11 +1284,41 @@ class ForgeInput(ForgeLayer):
 # start swift source generation
 
 swift_src = []
-swift_src.append("")
-swift_src.append("// begin of autogenerated forge net generation code")
-swift_src.append("")
-#swift_src.append("var model:Model")
-#swift_src.append("")
+
+def capitalize(name):
+  return "".join(list(map(lambda w: w.title(), name.split("_"))))
+
+src_class_name = capitalize(model_name)
+src_file_name = src_class_name+".swift"
+
+date_string = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+swift_src.append(
+'''
+//
+//  Begin of autogenerated swift source code
+//
+//  {}
+//
+//  created {} by keras2metal.py
+//
+//  Converter wittenn by Pavel Mayer, Tognos GmbH, http://tognos.com/
+//  based on YADK and Forge yolo2metal.py
+//
+
+import Foundation
+import Forge
+import MetalPerformanceShaders
+
+final class {} {{
+
+var model: Model
+var device: MTLDevice
+let name = "{}"
+
+public init(device: MTLDevice) {{
+  self.device = device
+'''.format(src_file_name, date_string, src_class_name, model_name))
 
 # declare activation functions
 
@@ -1379,7 +1453,7 @@ for section in sections:
         line += layer_id
         if len(line)-char_offset > 70:
           line +="\n        "
-          char_offset += len(line)
+          char_offset = len(line)
         if index < len(section.layers)-1:
           line += " --> "
       if PLOT_MODELS:
@@ -1408,18 +1482,23 @@ for section in sections:
     for index, layer_id in enumerate(section.layers):
       if PLOT_MODELS:
         addDotEdge(layer_id, collector, {"bold_frame": layer_id == var_name,"pos":4})
-      line += layer_id
+      if layer_class == "Lambda" and layer.name.startswith("block") and index == 1:
+        # inception-resnet lambda layer, output = input_0 + scale * input_1
+        scale = layer.get_config()["arguments"]["scale"]
+        line += '{} --> Activation('\
+                'MPSCNNNeuronLinear(device: device, a: {}, b: 0), name: "{}")'\
+                .format(layer_id, scale, "scale_input1_"+layer.name)
+      else:
+        line += layer_id
       if index < len(section.layers)-1:
         line += ", "
     if merge_function != "Concatenate":
       line += '], name: "for_{}")'.format(layer.name)
       
       if layer_class == "Lambda" and layer.name.startswith("block"):
-        # inception-resnet lambda layer
+        # inception-resnet lambda layer, output = input_0 + scale * input_1
         scale = layer.get_config()["arguments"]["scale"]
-        line += ' --> Add(name: "{}") --> Activation('\
-                'MPSCNNNeuronLinear(device: device, a: {}, b: 0), name: "{}")'\
-                .format(layer.name, scale, "scale_"+layer.name)
+        line += ' --> Add(name: "{}")'.format(layer.name)
       else:
         # Forge merge layers have the same class name as keras layers
         line += ' --> {}(name: "{}")'.format(layer_class,layer.name)
@@ -1450,18 +1529,27 @@ else:
 
 swift_src.append("model = Model(input: input, output: output)")
 swift_src.append("}")
-swift_src.append("let success = model.compile(device: device, inflightBuffers: inflightBuffers) { ")
+swift_src.append("} // init")
+
+swift_src.append("public func compile(inflightBuffers: Int) -> Bool {")
+
+swift_src.append("return model.compile(device: device, inflightBuffers: inflightBuffers) { ")
 swift_src.append("  name, count, type in ParameterLoaderBundle(name: name,")
 swift_src.append("  count: count,")
 swift_src.append('  prefix: "{}-",'.format(model_name))
 swift_src.append('  suffix: type == .weights ? ".weights" : ".biases",')
 swift_src.append('  ext: "bin")')
 swift_src.append("}")
+swift_src.append("} // func")
+swift_src.append("} // class")
 swift_src.append("")
 swift_src.append("// end of autogenerated forge net generation code")
 
-for line in swift_src:
-  print(line)
+with open(SRC_OUT_DIR+"/"+src_file_name, "w") as src_file:
+  for line in swift_src:
+    print(line, file=src_file)
+    if VERBOSE:
+      print(line)
 
 new_model.save(file_name_plus(model_path, "_nobn"))
 
@@ -1469,29 +1557,34 @@ if PLOT_MODELS:
   addAllEdges()
   to_file=changed_extension(file_name_plus(model_path,'_forge'),'.png')
   dot.write(to_file, format="png")
-  print("dot file:")
-  print("-------------------------------------------------------------")
-  print(dot.to_string())
-  print("-------------------------------------------------------------")
+  if MORE_VERBOSE:
+    print("dot file:")
+    print("-------------------------------------------------------------")
+    print(dot.to_string())
+    print("-------------------------------------------------------------")
 
+if not QUICK_RUN:
+  # Make a prediction using the original model and also using the model that
+  # has batch normalization removed, and check that the differences between
+  # the two predictions are small enough. They seem to be smaller than 1e-4,
+  # which is good enough for us, since we'll be using 16-bit floats anyway.
 
-# Make a prediction using the original model and also using the model that
-# has batch normalization removed, and check that the differences between
-# the two predictions are small enough. They seem to be smaller than 1e-4,
-# which is good enough for us, since we'll be using 16-bit floats anyway.
+  print("Comparing models...")
 
-print("Comparing models...")
+  #image_data = np.random.random((1, 608, 608, 3)).astype('float32')
 
-#image_data = np.random.random((1, 416, 416, 3)).astype('float32')
-#image_data = np.random.random((1, 608, 608, 3)).astype('float32')
-test_shape = (1, batch_input_shape[1], batch_input_shape[2],batch_input_shape[3])
-image_data = np.random.random(test_shape).astype('float32')
+  test_shape = None
+  if batch_input_shape[1] != None and batch_input_shape[2] != None:
+    test_shape = (1, batch_input_shape[1], batch_input_shape[2],batch_input_shape[3])
+  else:
+    test_shape = (1, 299, 299, 3)
+  image_data = np.random.random(test_shape).astype('float32')
 
-features = model.predict(image_data)
-features_auto = new_model.predict(image_data)
+  features = model.predict(image_data)
+  features_auto = new_model.predict(image_data)
 
-ddprint("features.shape:"+str(features.shape))
-ddprint("features_auto.shape:"+str(features_auto.shape))
+  ddprint("features.shape:"+str(features.shape))
+  ddprint("features_auto.shape:"+str(features_auto.shape))
 
 def compare_features_fast(features1, features2):
   error = np.abs(features1 - features2)
@@ -1519,11 +1612,12 @@ def compare_features_yolo(features1, features2):
   print("Largest error:", max_error)
 
 if MODEL != "YOLO" and MODEL!="TINY_YOLO":
-  compare_features_fast(features, features_auto)
+  if not QUICK_RUN:
+    compare_features_fast(features, features_auto)
   if RUN_CLASSIFIER:
     predict_in_dir([model, new_model], IMAGE_DIR)
 else:
-  compare_features_yolo(features, features_auto)
+  if not QUICK_RUN:
+    compare_features_yolo(features, features_auto)
 
 print("Done!")
-
