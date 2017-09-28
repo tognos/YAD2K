@@ -88,8 +88,15 @@ def check2(file1, file2, shapes1, shapes2):
   data2 = np.fromfile(file2, dtype = np.float32)
   shape1 = shape_for_path(file1, shapes1)
   shape2 = shape_for_path(file2, shapes2)
-  print("orig shape1:", shape1)
-  print("orig shape2:", shape2)
+  if -1 in shape2:
+    print("shape2 is undefined, using shape1 for both inputs")
+    shape2 = shape1
+  elif -1 in shape1:
+    print("shape1 is undefined, using shape2 for both inputs")
+    shape1 = shape2
+
+  print("shape1:", shape1)
+  print("shape2:", shape2)
   width, height, channels, images = shape1
   if channels == 3:
    # 3 channels, make color image

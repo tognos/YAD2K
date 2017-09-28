@@ -1231,7 +1231,7 @@ class ForgeInput(ForgeLayer):
     # know that from the model; there is nothing about that in the input config
     if SCALE_INPUT_TO_MINUS_1_AND_1:
       # "let {} = input --> Resize(width: {}, height: {}) --> Activation(input_scale)"
-      line += " --> Activation(input_scale)"
+      line += ' --> Activation(input_scale, name: "input_scale")'
     src.append(line)
     ddprint(src)
     input_already_defined = True
