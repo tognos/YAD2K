@@ -40,7 +40,7 @@ import sys
 parser = argparse.ArgumentParser(description='Convert Keras Models to Forge Metal Models',
                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('model',
-  choices=['INCEPTION_V3', 'RESNET_50','VGG16','INCEPTION_RESNET_V2', 'MOBILE_NET'])
+  choices=['INCEPTION_V3', 'RESNET_50','VGG16','INCEPTION_RESNET_V2', 'MOBILE_NET', 'XCEPTION'])
 parser.add_argument('input_image', help="path to an imgage or a .float file")
 parser.add_argument('--input_dims',
                   help='width and height of the input image; required when using a .float file without shapes dictionary')
@@ -82,19 +82,19 @@ if MODEL=="RESNET_50":
   from keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
   model_name = "resnet_50"
   if MODEL_PATH is None:
-    model = ResNnet50(weights='imagenet')
+    model = ResNnet50(weights='imagenet', input_shape = (224, 224, 3))
 
 if MODEL=="VGG16":
   from keras.applications.vgg16 import VGG16, preprocess_input, decode_predictions
   model_name = "vgg_16"
   if MODEL_PATH is None:
-    model = VGG16(weights='imagenet')
+    model = VGG16(weights='imagenet', input_shape = (224, 224, 3))
 
 if MODEL=="INCEPTION_RESNET_V2":
   from keras.applications.inception_resnet_v2 import InceptionResNetV2, preprocess_input, decode_predictions
   model_name = "inception_resnet_v2"
   if MODEL_PATH is None:
-    model = InceptionResNetV2(weights='imagenet')
+    model = InceptionResNetV2(weights='imagenet', input_shape = (299, 299, 3))
 
 if MODEL=="MOBILE_NET":
   from keras.applications.mobilenet import MobileNet, preprocess_input, decode_predictions,\
@@ -103,6 +103,12 @@ if MODEL=="MOBILE_NET":
   CUSTOM_OBJECTS = {'relu6': relu6, 'DepthwiseConv2D': DepthwiseConv2D}
   if MODEL_PATH is None:
     model = MobileNet(weights='imagenet')
+
+if MODEL=="XCEPTION":
+  from keras.applications.xception import Xception, preprocess_input, decode_predictions
+  model_name = "xception"
+  if MODEL_PATH is None:
+    model = Xception(weights='imagenet', input_shape = (299, 299, 3))
 
 if MODEL_PATH is not None:  
   model = load_model(MODEL_PATH, custom_objects = CUSTOM_OBJECTS)
@@ -186,7 +192,7 @@ def predict_image(model, img_path, output_dir, input_shape=None):
   print('Top 3 predictions: {}'.format(decode_predictions(preds, top=3)[0]))
 
   model_inputs = model.inputs
-  print('Computing activations for all layers (This may take about a minute when running Tensorflow runs on the CPU)')
+  print('Computing activations for all layers (This may take about a minute when running Tensorflow on the CPU)')
   activations = du.get_activations(model, x, print_shape_only=True, layer_name=None)
   print("Saving {} activations for model '{}' to directory '{}'".format(len(activations),model_name, output_dir))
   shape_info = {}

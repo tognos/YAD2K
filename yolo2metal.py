@@ -36,6 +36,7 @@ from keras.models import Sequential, load_model
 
 from keras.layers import Dense, Conv2D, ZeroPadding2D, Input, Activation
 from keras.layers import MaxPooling2D, GlobalAveragePooling2D, AveragePooling2D
+from keras.layers import SeparableConv2D
 from keras.layers import Add, Multiply, Average, Maximum
 from keras.layers import Flatten, Reshape, Dropout
 
@@ -55,7 +56,7 @@ parser = argparse.ArgumentParser(description='Convert Keras Models to Forge Meta
                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('model',
   choices=['TINY_YOLO', 'YOLO', 'INCEPTION_V3', 'RESNET_50','VGG16','INCEPTION_RESNET_V2',
-           'MOBILE_NET'])
+           'MOBILE_NET', 'XCEPTION'])
 parser.add_argument('--param_dir', default="Parameters",
                   help='Path to directory to write the metal weights for optimized models')
 parser.add_argument('--orig_param_dir', default="OriginalParameters",
@@ -128,7 +129,7 @@ if MODEL=="INCEPTION_V3":
   SCALE_INPUT_TO_MINUS_1_AND_1 = True
   model_name = "inception_v3"
   model_path = MODEL_DIR+"/inception_v3.h5"
-  model = InceptionV3(weights='imagenet')
+  model = InceptionV3(weights='imagenet', input_shape = (299, 299, 3))
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
 
@@ -137,10 +138,9 @@ if MODEL=="INCEPTION_RESNET_V2":
   SCALE_INPUT_TO_MINUS_1_AND_1 = True
   model_name = "inception_resnet_v2"
   model_path = MODEL_DIR+"/inception_resnet_v2.h5"
-  model = InceptionResNetV2(weights='imagenet')
+  model = InceptionResNetV2(weights='imagenet', input_shape = (299, 299, 3))
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
-
 
 if MODEL=="RESNET_50":
   from keras.applications.resnet50 import ResNet50, preprocess_input, decode_predictions
@@ -148,7 +148,7 @@ if MODEL=="RESNET_50":
   SUBTRACT_IMAGENET_MEAN = True
   model_name = "resnet_50"
   model_path = MODEL_DIR+"/resnet50.h5"
-  model = ResNet50(weights='imagenet')
+  model = ResNet50(weights='imagenet', input_shape = (224, 224, 3))
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
 
@@ -158,23 +158,34 @@ if MODEL=="VGG16":
   SUBTRACT_IMAGENET_MEAN = True
   model_name = "vgg_16"
   model_path = MODEL_DIR+"/vgg_16.h5"
-  model = VGG16(weights='imagenet')
+  model = VGG16(weights='imagenet', input_shape = (224, 224, 3))
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
 
 if MODEL=="MOBILE_NET":
   from keras.applications.mobilenet import MobileNet, preprocess_input, decode_predictions,\
         relu6, DepthwiseConv2D
-#  SWAP_INPUT_IMAGE_CHANNELS = True
+  KEEP_SEPARATE_ACTIVATION_LAYERS = True # in iOS 11.01 there is a bug so we can't use ReLUN with Conv-Layers
   model_name = "mobilenet"
   model_path = MODEL_DIR+"/mobilenet.h5"
   CUSTOM_OBJECTS = {'relu6': relu6, 'DepthwiseConv2D': DepthwiseConv2D}
-  model = MobileNet(weights='imagenet')
+  model = MobileNet(weights='imagenet', input_shape = (224, 224, 3))
   if SAVE_ORIGINAL_MODEL:
     model.save(model_path)
 else:
   class DepthwiseConv2D:
     pass
+
+if MODEL=="XCEPTION":
+  from keras.applications.xception import Xception, preprocess_input, decode_predictions
+#  SWAP_INPUT_IMAGE_CHANNELS = True
+#  SUBTRACT_IMAGENET_MEAN = True
+  SCALE_INPUT_TO_MINUS_1_AND_1 = True
+  model_name = "xception"
+  model_path = MODEL_DIR+"/xception.h5"
+  model = Xception(weights='imagenet', input_shape = (299, 299, 3))
+  if SAVE_ORIGINAL_MODEL:
+    model.save(model_path)
 
 def file_name_plus(path_name, name_extension):
   path_file, extension = os.path.splitext(path_name)
@@ -300,8 +311,19 @@ def fold_batch_norm(conv_layer, bn_layer):
        the previous layer."""
     dddprint("Folding bn "+bn_layer.__class__.__name__+":\n"+pretty(bn_layer.get_config())+"\ninto conv "+conv_layer.__class__.__name__+":i\n"+pretty(conv_layer.get_config())+"\n")
     ddprint("Folding batchnorm layer'"+bn_layer.name+"' into conv '"+conv_layer.name+"', class "+conv_layer.__class__.__name__+"'")
-    conv_weights = conv_layer.get_weights()[0]
-    ddprint("conv_weights.shape="+str(np.shape(conv_weights)))
+
+    conv_weights = None
+    sep_weights = None
+    if type(conv_layer) in [SeparableConv2D]:
+      # SeparableConv2D has two sets of weights, one for the separable conv, one for the pointwise
+      # we will fold the batchnorm layer into the pointwise weights
+      sep_weights = conv_layer.get_weights()[0]
+      conv_weights = conv_layer.get_weights()[1]
+      ddprint("sep_weights.shape="+str(np.shape(sep_weights)))
+      ddprint("conv_weights.shape="+str(np.shape(conv_weights)))
+    else:
+      conv_weights = conv_layer.get_weights()[0]
+      ddprint("conv_weights.shape="+str(np.shape(conv_weights)))
 
     # Keras stores the learnable weights for a BatchNormalization layer
     # as four separate arrays:
@@ -333,16 +355,19 @@ def fold_batch_norm(conv_layer, bn_layer):
     
     epsilon = float(bn_layer.get_config()['epsilon'])
     new_weights = None
-    if type(conv_layer) == Conv2D:
+    if type(conv_layer) in [Conv2D, SeparableConv2D]:
       new_weights = conv_weights * gamma / np.sqrt(variance + epsilon)
-    elif type(conv_layer) == DepthwiseConv2D:
+    elif type(conv_layer) in [DepthwiseConv2D]:
       new_weights = (conv_weights.transpose(0,1,3,2) * gamma / np.sqrt(variance + epsilon)).transpose(0,1,3,2)
     else:
       raise RuntimeError("Unknown conv layer")
     new_bias = beta - mean * gamma / np.sqrt(variance + epsilon)
     ddprint("new_weights.shape="+str(np.shape(new_weights)))
     ddprint("new_bias.shape="+str(np.shape(new_bias)))
-    return new_weights, new_bias
+    if sep_weights is None:
+      return new_weights, new_bias
+    else:
+      return sep_weights, new_weights, new_bias
 
 all_layers = []
 prev_layer = None
@@ -496,7 +521,8 @@ if not QUICK_RUN:
       # check if we need to complete a skipped Conv2D without batchnorm
       if layer.__class__.__name__ != "BatchNormalization":
         for i in orig_inputs:
-          if i.__class__.__name__ in ["Conv2D","DepthwiseConv2D"] and i.name not in weights_by_name:
+          if i.__class__.__name__ in ["Conv2D","DepthwiseConv2D", "SeparableConv2D"] and\
+              i.name not in weights_by_name:
             # conv without following batchnorm, set normal weights for previous conv layer
             dprint("Conv2d layer without following batchnorm, set orig weight for layer ",i.name)
             prev_orig_layer = model.get_layer(name=i.name)
@@ -523,7 +549,7 @@ if not QUICK_RUN:
         #print("BNTEST:"+layer.__class__.__name__ +" "+ orig_inputs.__class__.__name__)
         
         if layer.__class__.__name__ == "BatchNormalization" and\
-            orig_inputs[0].__class__.__name__ in ["Conv2D", "DepthwiseConv2D"]:
+            orig_inputs[0].__class__.__name__ in ["Conv2D", "DepthwiseConv2D", "SeparableConv2D"]:
           # batchnorm following a conv2D layer
           # we need to set folded weights for the previous conv layer
           # which also has not been created yet
@@ -546,7 +572,8 @@ if not QUICK_RUN:
           layer_done = True
         if not layer_done:
           # process all layer types except conv2d if not the last layer
-          if layer.__class__.__name__ not in ["Conv2D", "DepthwiseConv2D"] or index + 1 == len(model.layers):
+          if layer.__class__.__name__ not in ["Conv2D", "DepthwiseConv2D", "SeparableConv2D"] or\
+              index + 1 == len(model.layers):
             new_layer = layer_clone(layer)
             inputs = input_layers_outputs(inbounds, output_by_name)
             register_new_layer(layer_name(layer), new_layer, new_layer(inputs))
@@ -603,7 +630,6 @@ def export_layers(the_model, model_name, dst_path):
     print('Creating output dir  "{}" for weights and biases'.format(dst_path))
     os.mkdir(dst_path)
    
-
   inbounds = find_inbound_layers(the_model)
 
   shape_info = {}
@@ -614,32 +640,27 @@ def export_layers(the_model, model_name, dst_path):
       ddprint("layer config:" +pretty(layer.get_config())) 
       dprint("Layer '{}' has {} weight arrays".format(layer.name, len(weights)))
     for i, w in enumerate(weights):
-      if i % 2 == 0:
+      if i % 2 == 0 and type(layer) != SeparableConv2D or\
+         i < 2 and type(layer) == SeparableConv2D: # SeparableConv2D has weights (sep, pointw, biases)
         # In "th" format convolutional kernels have the shape (depth, input_depth, rows, cols)
         # In "tf" format convolutional kernels have the shape (rows, cols, input_depth, depth)
         #                              aka shape (height, width, inputChannels, outputChannels)
         ddprint("Keras weights shape:"+str(w.shape))
         outfile = "{}-{}.weights.bin".format(model_name,layer.name)
+        if type(layer) == SeparableConv2D and i == 0:
+          outfile = "{}-{}_sep.weights.bin".format(model_name,layer.name)
         outpath = os.path.join(dst_path, outfile)
-        if type(layer) in [Conv2D]:
-          ddprint("Converting weights to metal for Conv2D layer") 
+        if type(layer) == Conv2D or (type(layer) == SeparableConv2D and i == 1):
+          ddprint("Converting weights to metal for Conv2D/SeparableConv2D layer") 
           tw = w
-          #if layer.get_config()["data_format"] == "channels_last":
-          #elif layer.get_config()["data_format"] == "channels_first":
-          #else:
-          #  raise RuntimeError("unknown kernel weight format")
           # metal wants:  weight[ outputChannels ][ kernelHeight ][ kernelWidth ][ inputChannels / groups ]
           tw = w.transpose(3, 0, 1, 2)
           ddprint("Metal conv weights shape:"+str(tw.shape))
           write_np_array(tw, outpath)
           shape_info[outfile] = tw.shape
-        elif type(layer) in [DepthwiseConv2D]:
-          ddprint("Converting weights to metal for DepthwiseConv2D layer") 
+        elif type(layer) == DepthwiseConv2D or (type(layer) == SeparableConv2D and i == 0):
+          ddprint("Converting weights to metal for DepthwiseConv2D/SeparableConv2D sep layer") 
           tw = w
-          #if layer.get_config()["data_format"] == "channels_last":
-          #elif layer.get_config()["data_format"] == "channels_first":
-          #else:
-          #  raise RuntimeError("unknown kernel weight format")
           # metal wants:  weight[ outputChannels ][ kernelHeight ][ kernelWidth ][ inputChannels / groups ]
           tw = w.transpose(2, 0, 1, 3)
           ddprint("Metal conv weights shape:"+str(tw.shape))
@@ -794,7 +815,8 @@ def replaced_activation_layers(inbound_by_name, model):
       'swift_prefix' in params_of_activation[activation_of_layer[layer.name]]:
       inbound = inbound_by_name[layer.name][0]
       inbound_layer = model.get_layer(inbound)
-      if type(inbound_layer) in [Conv2D, DepthwiseConv2D] and not KEEP_SEPARATE_ACTIVATION_LAYERS:
+      if type(inbound_layer) in [Conv2D, DepthwiseConv2D, SeparableConv2D]\
+          and not KEEP_SEPARATE_ACTIVATION_LAYERS:
         replacements[layer.name] = inbound_layer.name
   return replacements
 
@@ -1129,6 +1151,10 @@ def index_2_or_299(value):
 def quote_string(name):
   return '"{}"'.format(name)
 
+def quote_sep_name(name):
+  return '"{}_sep"'.format(name)
+
+
 def is_function(arg):
   return callable(arg)
 
@@ -1140,9 +1166,13 @@ class ForgeLayer():
     self.name = layer.name
     self.forge_class = forge_class
     self.params = params
-  def swift_source(self):
+  def swift_source(self, constructor_only = False):
     ddprint(str(self.params))
-    line = "let {} = {}(".format(self.name, self.forge_class)
+    line = None
+    if constructor_only:
+      line = "{}(".format(self.forge_class)
+    else:
+      line = "let {} = {}(".format(self.name, self.forge_class)
     i = 1
     for swift_param in self.params:
       origin = self.params[swift_param]
@@ -1214,6 +1244,41 @@ class ForgeDepthwiseConv2D(ForgeLayer):
       raise RuntimeError("Forge only supports depth_multiplier == 1")
     super().__init__(layer, "DepthwiseConvolution", params)
 
+class ForgeSeparableConv2DPointWise(ForgeLayer):
+  def __init__(self, layer, var_name_of_activation):
+    params = OrderedDict([ 
+      ("channels"  , ("filters",)),
+      ("activation", ("", "nil", 
+        var_name_of_activation[activation_of_layer[activation_layer(layer.name)]])),
+      ("useBias"   , ("use_bias", True)),
+      ("name"    , ("name","",quote_string))
+    ])
+    if layer.get_config()["depth_multiplier"] != 1:
+      raise RuntimeError("Forge only supports depth_multiplier == 1")
+    super().__init__(layer, "PointwiseConvolution", params)
+  
+class ForgeSeparableConv2D(ForgeLayer):
+  def __init__(self, layer, var_name_of_activation):
+    params = OrderedDict([ 
+      ("kernel"    , ("kernel_size","",swap_2_coords)),
+      ("channelMultiplier", ("depth_multiplier",1)),
+      ("stride"    , ("strides", (1, 1))),
+      ("padding"   , ("padding", ".same", to_swift_enum)),
+      ("useBias"   , ("", True, "false")),
+      ("activation", ("", "nil", "nil")), 
+      ("name"    , ("name","",quote_sep_name))
+    ])
+    #print(pretty(layer.get_config()))
+    if layer.get_config()["depth_multiplier"] != 1:
+      raise RuntimeError("Forge only supports depth_multiplier == 1")
+    super().__init__(layer, "DepthwiseConvolution", params)
+    self.name = self.name + "_sep"
+    self.point_wise = ForgeSeparableConv2DPointWise(layer, var_name_of_activation)
+  def swift_source(self):
+    lines = super().swift_source()
+    pw_lines = self.point_wise.swift_source()
+    lines.extend(pw_lines)
+    return lines
 
 # Generate Forge layer "Activation"
 #init(_ activation: MPSCNNNeuron, name: String = "")
@@ -1430,8 +1495,10 @@ for index, layer in enumerate(new_model.layers):
     swift_obj = None
     if type(layer) == Conv2D:
       swift_obj = ForgeConv2D(layer, var_name_of_activation)
-    elif type(layer) == DepthwiseConv2D:
+    elif type(layer) in [DepthwiseConv2D]:
       swift_obj = ForgeDepthwiseConv2D(layer, var_name_of_activation)
+    elif type(layer) in [SeparableConv2D]:
+      swift_obj = ForgeSeparableConv2D(layer, var_name_of_activation)
     elif type(layer) == keras.engine.topology.InputLayer:
       swift_obj = ForgeInput(layer)
     elif type(layer) == MaxPooling2D:
@@ -1529,7 +1596,10 @@ for section in sections:
     prev_id = None
     for index, layer_id in enumerate(section.layers):
       if class_of_layer[layer_id] not in ignore_layer_types:
-        line += layer_id
+        if class_of_layer[layer_id] == "SeparableConv2D":
+          line += layer_id+"_sep --> "+layer_id
+        else:
+          line += layer_id
         if len(line)-char_offset > 70:
           line +="\n        "
           char_offset = len(line)
@@ -1558,7 +1628,6 @@ for section in sections:
       if merge_function != "Concatenate":
         collector = "for_"+section.name
         addDotNode(collector, "Collect", {"bold_frame": False ,"pos":2})
-
     line = "let "+var_name + " = {}([".format(merge_function)
     for index, layer_id in enumerate(section.layers):
       if PLOT_MODELS:
@@ -1607,7 +1676,6 @@ else:
   if PLOT_MODELS:
     addDotNode("output", "Tensor", {"bold_frame": True, "pos":8})
     addDotEdge(output_layers[0], "output", {"pos":7})
-
 swift_src.append("model = Model(input: input, output: output)")
 swift_src.append("}")
 swift_src.append("} // init")
@@ -1646,7 +1714,6 @@ if PLOT_MODELS:
     print("-------------------------------------------------------------")
     print(dot.to_string())
     print("-------------------------------------------------------------")
-
 print("Testing...")
 
 if not QUICK_RUN:
