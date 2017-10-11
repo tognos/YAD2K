@@ -10,6 +10,8 @@ import json
 parser = argparse.ArgumentParser(description='compare .float binary files')
 parser.add_argument('dir1', help='path to directory containing .float files')
 parser.add_argument('dir2',  nargs='?', help='path to another directory containing .float files')
+parser.add_argument('--shapes1', default="shapes.json", help='name of .json file with shapes in dir1')
+parser.add_argument('--shapes2', default="shapes.json", help='name of .json file with shapes in dir2')
 
 def compare_features_fast(features1, features2):
   error = np.abs(features1 - features2) 
@@ -147,16 +149,16 @@ def load_json(file_name):
       data = json.load(json_data)
     return data
 
-def load_shapes(data_path):
+def load_shapes(data_path, shape_file):
   data_dir = os.path.dirname(data_path)
-  shape_path = os.path.join(data_dir, "shapes.json")
+  shape_path = os.path.join(data_dir, shape_file)
   if os.path.exists(shape_path):
     return load_json(shape_path)
   return None
 
 def _main(args):
     dir1 = os.path.expanduser(args.dir1)
-    shapes1 = load_shapes(dir1)
+    shapes1 = load_shapes(dir1, args.shapes1)
 
     if args.dir2 is None:
       check1(dir1, shapes1)
@@ -164,7 +166,7 @@ def _main(args):
 
     dir2 = os.path.expanduser(args.dir2)
     #print(shapes1)
-    shapes2 = load_shapes(dir2)
+    shapes2 = load_shapes(dir2, args.shapes2)
     #print(shapes2)
 
     if os.path.isfile(dir1) and os.path.isfile(dir2):

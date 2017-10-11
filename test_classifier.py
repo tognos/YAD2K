@@ -40,7 +40,7 @@ import sys
 parser = argparse.ArgumentParser(description='Convert Keras Models to Forge Metal Models',
                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('model',
-  choices=['INCEPTION_V3', 'RESNET_50','VGG16','INCEPTION_RESNET_V2'])
+  choices=['INCEPTION_V3', 'RESNET_50','VGG16','INCEPTION_RESNET_V2', 'MOBILE_NET'])
 parser.add_argument('input_image', help="path to an imgage or a .float file")
 parser.add_argument('--input_dims',
                   help='width and height of the input image; required when using a .float file without shapes dictionary')
@@ -64,10 +64,13 @@ MODEL_PATH = opts.model_path
 FEATURES_DIR = opts.features_dir
 INPUT_IMAGE = opts.input_image
 INPUT_DIMS = None
+
 if opts.input_dims is not None:
   dims = ast.literal_eval("("+opts.input_dims+")")
   assert len(dims) == 2, "input_dims must be two integers width,height"
   INPUT_DIMS = dims
+
+CUSTOM_OBJECTS = None
 
 if MODEL=="INCEPTION_V3":
   from keras.applications.inception_v3 import InceptionV3, preprocess_input, decode_predictions
@@ -93,8 +96,16 @@ if MODEL=="INCEPTION_RESNET_V2":
   if MODEL_PATH is None:
     model = InceptionResNetV2(weights='imagenet')
 
+if MODEL=="MOBILE_NET":
+  from keras.applications.mobilenet import MobileNet, preprocess_input, decode_predictions,\
+       relu6, DepthwiseConv2D
+  model_name = "mobilenet"
+  CUSTOM_OBJECTS = {'relu6': relu6, 'DepthwiseConv2D': DepthwiseConv2D}
+  if MODEL_PATH is None:
+    model = MobileNet(weights='imagenet')
+
 if MODEL_PATH is not None:  
-  model = load_model(MODEL_PATH)
+  model = load_model(MODEL_PATH, custom_objects = CUSTOM_OBJECTS)
 
 if DEBUG_OUT:
   model.summary()
@@ -157,7 +168,9 @@ def predict_image(model, img_path, output_dir, input_shape=None):
   if os.path.splitext(img_path)[1] == ".floats":
     if input_shape == None:
       input_shape = [1, batch_input_shape[1], batch_input_shape[2], batch_input_shape[3]]
-    x = load_input_from_floats(img_path, [1, input_shape[1], input_shape[0], 3])
+      x = load_input_from_floats(img_path, input_shape)
+    else:
+      x = load_input_from_floats(img_path, [1, input_shape[1], input_shape[0], 3])
   else:
     if input_shape == None:
       input_shape = batch_input_shape[1:3]
