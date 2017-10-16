@@ -585,7 +585,7 @@ if not QUICK_RUN:
   new_model = Model(inputs=all_layers[0], outputs=all_layers[-1])
 else:
   print("Loading optimized model (with batchnorm folding)\n")
-  new_model = load_model(file_name_plus(model_path, "_nobn"))
+  new_model = load_model(file_name_plus(model_path, "_nobn"), custom_objects = CUSTOM_OBJECTS)
 
 if VERBOSE:
   new_model.summary()

@@ -175,7 +175,7 @@ to compare the feature maps; take a look at the graph images to identify corresp
 On iPhone 7 and 7 Plus:
 
 | Net                      | fps  | top1  | top5  | layers | tensors | parameters  |
-|--------------------------|------|-------|-------|--------|---------|-------------|
+|--------------------------|-----:|------:|------:|-------:|--------:|------------:|
 | TinyYolo  (VOC, 416x416) |   15 |     - |     - |     16 |      17 |  15.858.717 |
 | Yolo 2 (COCO, 608x608)   |  2.2 |     - |     - |     30 |      32 |  50.952.553 |
 | VGG16                    |  7.2 | 0.715 | 0.901 |     26 |      27 | 138.357.544 |
@@ -186,6 +186,12 @@ On iPhone 7 and 7 Plus:
 | Xception                 |  5.1 | 0.790 | 0.945 |    106 |     119 |  22.828.688 |
 
 (*) With separate relu6 activation layers because of a MPSCNNConvolution bug
+
+top1 and top2 are the classfication accuracies according to the [Keras documentation](https://keras.io/applications/#documentation-for-individual-models).
+
+fps was measured under iOS 11.0.3 on an iPhone 7 with the Forge Inceptions example. 
+
+Layers, tensors an parameters are the numbers output by the Forge framework.
 
 [![license](https://img.shields.io/github/license/mashape/apistatus.svg)](LICENSE)
 
